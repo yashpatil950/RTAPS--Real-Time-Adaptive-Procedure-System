@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Live bridge: Pupil Capture -> RTAPS streaming backend.
 
-Run this on the machine that has Pupil Capture open. It subscribes to three
-ZMQ topics — `pupil`, `blinks`, `fixations` — and forwards each message to
-the corresponding backend endpoint as small batched POSTs.
+Run this on the machine that has Pupil Capture open. It subscribes to Pupil IPC
+topics for pupil samples, blinks, and fixations, then forwards each message to
+the matching backend endpoint as small POSTs.
 
 Prerequisites in Pupil Capture:
   * **Network API** plugin enabled (default port 50020)
@@ -28,6 +28,7 @@ import argparse
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +59,11 @@ def _cli() -> argparse.Namespace:
     ap.add_argument("--pupil_batch_ms", type=int, default=100,
                     help="Flush pupil batch at most this many ms after the first sample")
     ap.add_argument("--api_token", default="", help="Optional bearer token for the backend")
+    ap.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Log ZMQ topics / fixation payload keys (for debugging missing fixations)",
+    )
     return ap.parse_args()
 
 
@@ -72,6 +78,23 @@ class BridgeContext:
     backend_url: str
     headers: dict[str, str]
     session: requests.Session
+
+
+def _unpack_payload(payload_raw: bytes) -> dict[str, Any]:
+    """Decode msgpack from Pupil; normalize keys to str (some stacks emit bytes keys)."""
+    try:
+        obj = msgpack.unpackb(payload_raw, raw=False, strict_map_key=False)
+    except TypeError:
+        obj = msgpack.unpackb(payload_raw, raw=False)
+    except Exception:
+        obj = msgpack.unpackb(payload_raw)
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in obj.items():
+        key = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+        out[key] = v
+    return out
 
 
 def _post(ctx: BridgeContext, path: str, body: dict[str, Any]) -> None:
@@ -146,7 +169,7 @@ class PupilBatcher:
         _post(self._ctx, "/stream/pupil", {"stream_id": self._ctx.stream_id, "samples": batch})
 
 
-def _handle_blink(ctx: BridgeContext, payload: dict) -> None:
+def _handle_blink(ctx: BridgeContext, payload: dict[str, Any]) -> None:
     body = {
         "stream_id": ctx.stream_id,
         "blinks": [
@@ -160,17 +183,53 @@ def _handle_blink(ctx: BridgeContext, payload: dict) -> None:
     _post(ctx, "/stream/blinks", body)
 
 
-def _handle_fixation(ctx: BridgeContext, payload: dict) -> None:
-    norm = payload.get("norm_pos", [0.5, 0.5])
+def _handle_fixation(ctx: BridgeContext, payload: dict[str, Any]) -> None:
+    """Map Pupil Online Fixation Detector payload → backend FixationEvent.
+
+    Pupil docs use `start_timestamp` + `duration` (ms) + `norm_pos_x/y`; older
+    builds used `timestamp` + `norm_pos`. Using wall time when timestamps are
+    missing breaks the sliding window (fixations vanish from `window_arrays`).
+    """
+    ts = payload.get("start_timestamp")
+    if ts is None:
+        ts = payload.get("timestamp")
+    if ts is None:
+        log.warning("fixation message missing start_timestamp/timestamp; skip")
+        return
+    ts_f = float(ts)
+
+    nx = payload.get("norm_pos_x")
+    ny = payload.get("norm_pos_y")
+    if nx is None or ny is None:
+        norm = payload.get("norm_pos")
+        if isinstance(norm, (list, tuple)) and len(norm) >= 2:
+            nx, ny = float(norm[0]), float(norm[1])
+        else:
+            nx, ny = 0.5, 0.5
+    else:
+        nx, ny = float(nx), float(ny)
+
+    dur_raw = float(payload.get("duration", 0.0))
+    # Pupil reports fixation duration in milliseconds (see Pupil Network API docs).
+    dur_s = dur_raw / 1000.0
+
+    disp_raw = payload.get("dispersion")
+    try:
+        dispersion = float(disp_raw) if disp_raw is not None else 0.0
+    except (TypeError, ValueError):
+        dispersion = 0.0
+    if dispersion < 0 or dispersion != dispersion:  # NaN
+        dispersion = 0.0
+
     body = {
         "stream_id": ctx.stream_id,
         "fixations": [
             {
-                "start_timestamp": float(payload.get("timestamp", time.time())),
-                "duration": float(payload.get("duration", 0.0)) / 1000.0,  # Pupil emits ms
-                "dispersion": float(payload.get("dispersion", 0.0)),
-                "norm_x": float(norm[0]) if len(norm) > 0 else 0.5,
-                "norm_y": float(norm[1]) if len(norm) > 1 else 0.5,
+                "start_timestamp": ts_f,
+                "duration": max(0.0, dur_s),
+                "dispersion": dispersion,
+                "norm_x": nx,
+                "norm_y": ny,
             }
         ],
     }
@@ -184,6 +243,8 @@ def _handle_fixation(ctx: BridgeContext, payload: dict) -> None:
 
 def main() -> int:
     args = _cli()
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
     headers = {"Content-Type": "application/json"}
     if args.api_token:
         headers["Authorization"] = f"Bearer {args.api_token}"
@@ -197,7 +258,9 @@ def main() -> int:
     log.info("Connecting to Pupil Capture at %s:%d ...", args.pupil_host, args.pupil_port)
     zctx, sub, sub_port = _connect_pupil(args.pupil_host, args.pupil_port)
     log.info("Subscribed to SUB port %s", sub_port)
-    for topic in ("pupil.", "blinks", "fixations"):
+    # Prefix subscriptions — Pupil envelope topics vary by release.
+    # Use `blink` / `fixation` prefixes so both singular and plural topic names match.
+    for topic in ("pupil.", "blink", "fixation"):
         sub.setsockopt_string(zmq.SUBSCRIBE, topic)
 
     batcher = PupilBatcher(
@@ -215,15 +278,41 @@ def main() -> int:
         while True:
             socks = dict(poller.poll(timeout=50))
             if sub in socks:
-                topic, payload_raw = sub.recv_multipart()
-                topic_str = topic.decode("utf-8")
-                payload = msgpack.unpackb(payload_raw)
+                parts = sub.recv_multipart()
+                if len(parts) < 2:
+                    continue
+                topic_str = parts[0].decode("utf-8", errors="replace")
+                # First frame after topic is always msgpack dict; extra frames are raw attachments.
+                payload_raw = parts[1]
+                payload = _unpack_payload(payload_raw)
+                if args.verbose and (
+                    "fixat" in topic_str.lower()
+                    or payload.get("topic") in ("fixation", "fixations")
+                    or (
+                        isinstance(payload.get("subject"), str)
+                        and "fixat" in payload["subject"].lower()
+                    )
+                ):
+                    log.debug(
+                        "zmq topic=%r frames=%d payload_keys=%s",
+                        topic_str,
+                        len(parts),
+                        sorted(payload.keys()),
+                    )
                 if topic_str.startswith("pupil"):
                     batcher.add(payload)
-                elif topic_str.startswith("blinks"):
+                elif topic_str.startswith("blink"):
                     _handle_blink(ctx, payload)
-                elif topic_str.startswith("fixations"):
+                elif topic_str.startswith("fixation"):
                     _handle_fixation(ctx, payload)
+                elif topic_str.startswith("notify."):
+                    # Notifications use envelope ``notify.<subject>``; datum may repeat inner ``topic``.
+                    it = payload.get("topic")
+                    subj = payload.get("subject")
+                    if it in ("fixation", "fixations"):
+                        _handle_fixation(ctx, payload)
+                    elif isinstance(subj, str) and "fixation" in subj.lower() and payload.get("start_timestamp") is not None:
+                        _handle_fixation(ctx, payload)
             batcher.maybe_flush()
     except KeyboardInterrupt:
         log.info("Interrupted; exiting.")

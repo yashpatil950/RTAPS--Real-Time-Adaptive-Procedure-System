@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import {
   Activity,
   ArrowLeft,
   Brain,
   Eye,
   Layers,
+  ListTree,
   Radio,
   RefreshCw,
   Server,
@@ -29,11 +30,11 @@ import {
   getSessionDashboard,
   getStoredStreamId,
   getStreamingBaseUrl,
+  isStreamingIntegrationEnabled,
   setStoredStreamId,
   streamingReady,
   subscribePredictions,
   setStreamingIntegrationEnabled,
-  STORAGE_STREAMING_ENABLED,
 } from '../services/streamingApi';
 
 const FEATURE_ORDER = [
@@ -92,15 +93,10 @@ function StableValue({ label, value, sub }) {
 }
 
 export default function StreamingDashboard() {
+  const location = useLocation();
   const [streamId, setStreamId] = useState(() => getStoredStreamId());
   const [pollMs, setPollMs] = useState(400);
-  const [integrateSessions, setIntegrateSessions] = useState(() => {
-    try {
-      return localStorage.getItem(STORAGE_STREAMING_ENABLED) === '1';
-    } catch (_) {
-      return false;
-    }
-  });
+  const [integrateSessions, setIntegrateSessions] = useState(() => isStreamingIntegrationEnabled());
 
   const [backendReady, setBackendReady] = useState(null);
   const [dash, setDash] = useState(null);
@@ -112,6 +108,10 @@ export default function StreamingDashboard() {
   const persistStreamId = useCallback(() => {
     setStoredStreamId(streamId.trim());
   }, [streamId]);
+
+  useEffect(() => {
+    setStreamId(getStoredStreamId());
+  }, [location.pathname]);
 
   const toggleIntegration = (v) => {
     setIntegrateSessions(v);
@@ -159,6 +159,8 @@ export default function StreamingDashboard() {
           if (d?.last_prediction) {
             const { qa: _qa, ...rest } = d.last_prediction;
             setPred(rest);
+          } else {
+            setPred(null);
           }
           setLastError('');
         }
@@ -219,6 +221,20 @@ export default function StreamingDashboard() {
       { name: 'High', key: 'high', value: p.high ?? 0, fill: '#ef4444' },
     ];
   }, [pred]);
+
+  /** Procedure / step / session duration come from predictions once inference runs.
+   *  Until then the dashboard snapshot already exposes UI-synced fields from `/session/start`
+   *  and `/session/step_change`; session duration matches backend: latest_pupil_t − session_started_at.
+   */
+  const sessionContext = useMemo(() => {
+    const procedureId = pred?.procedure_id ?? dash?.procedure_id ?? null;
+    const stepNumber = pred?.step_number ?? dash?.step_number ?? null;
+    let cumulativeSessionTimeS = pred?.cumulative_session_time_s;
+    if (cumulativeSessionTimeS == null && dash?.latest_pupil_t != null && dash?.session_started_at != null) {
+      cumulativeSessionTimeS = dash.latest_pupil_t - dash.session_started_at;
+    }
+    return { procedureId, stepNumber, cumulativeSessionTimeS };
+  }, [dash, pred]);
 
   const windowProgress = useMemo(() => {
     const win = dash?.sliding_window || {};
@@ -315,7 +331,7 @@ export default function StreamingDashboard() {
               className="tablet-input font-mono text-base"
               value={streamId}
               onChange={(e) => setStreamId(e.target.value)}
-              placeholder="e.g. S232_T002"
+              placeholder="e.g. S232_T002 — or open a procedure session to auto-fill"
             />
           </div>
           <div className="w-32">
@@ -348,7 +364,12 @@ export default function StreamingDashboard() {
             Sync procedure UI → backend
           </label>
         </div>
-        <p className="text-xs text-slate-500 mt-3 font-mono break-all">
+        <p className="text-xs text-slate-500 mt-3">
+          Opening <code className="bg-slate-100 px-1 rounded">/session/…</code> saves a stream ID like{' '}
+          <code className="bg-slate-100 px-1 rounded">RTAPS_…_P1_T1</code> so this page and the backend stay in sync. Use the same ID
+          for <code className="bg-slate-100 px-1 rounded">pupil_capture_bridge.py --stream_id</code>, or set it manually above.
+        </p>
+        <p className="text-xs text-slate-500 mt-2 font-mono break-all">
           API base: <span className="text-slate-700">{getStreamingBaseUrl()}</span>
         </p>
       </div>
@@ -515,8 +536,39 @@ export default function StreamingDashboard() {
           </Panel>
         </div>
 
-        {/* Model output */}
+        {/* Model output + inputs (procedure / step / time are task inputs echoed on predictions for traceability) */}
         <div className="xl:col-span-7 space-y-4">
+          <Panel
+            title="Session & task inputs"
+            icon={ListTree}
+            rightSlot={
+              <span className="text-[10px] text-slate-500 max-w-[14rem] text-right leading-snug">
+                From RTAPS UI + clock; same values as three rows in the feature vector
+              </span>
+            }
+          >
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <StableValue
+                label="Procedure"
+                value={
+                  sessionContext.procedureId != null
+                    ? PROCEDURE_NAMES[sessionContext.procedureId] || `#${sessionContext.procedureId}`
+                    : '—'
+                }
+              />
+              <StableValue label="Step #" value={sessionContext.stepNumber != null ? sessionContext.stepNumber : '—'} />
+              <StableValue
+                label="Session time"
+                sub="cumulative_session_time_s"
+                value={
+                  sessionContext.cumulativeSessionTimeS != null
+                    ? `${formatNum(sessionContext.cumulativeSessionTimeS, 1)} s`
+                    : '—'
+                }
+              />
+            </div>
+          </Panel>
+
           <Panel
             title="Model output (streaming)"
             icon={Brain}
@@ -562,17 +614,7 @@ export default function StreamingDashboard() {
               </div>
             </div>
 
-            <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-2">
-              <StableValue
-                label="Procedure"
-                value={pred?.procedure_id != null ? PROCEDURE_NAMES[pred.procedure_id] || `#${pred.procedure_id}` : '—'}
-              />
-              <StableValue label="Step #" value={pred?.step_number != null ? pred.step_number : '—'} />
-              <StableValue
-                label="Session time"
-                sub="cumulative_session_time_s"
-                value={pred?.cumulative_session_time_s != null ? `${formatNum(pred.cumulative_session_time_s, 1)} s` : '—'}
-              />
+            <div className="mt-4">
               <StableValue
                 label="Inference"
                 value={pred?.inference_source || extras.inference_mode || '—'}
@@ -595,7 +637,16 @@ export default function StreamingDashboard() {
                     <tr key={name} className="border-b border-slate-50 hover:bg-slate-50/50">
                       <td className="py-2 px-3 font-mono text-slate-600">{name}</td>
                       <td className="py-2 px-3 font-mono text-right tabular-nums text-slate-900 font-semibold min-w-[120px]">
-                        {pred?.feature_values?.[name] !== undefined ? String(pred.feature_values[name]) : '—'}
+                        {pred?.feature_values?.[name] !== undefined
+                          ? String(pred.feature_values[name])
+                          : name === 'procedure_id' && sessionContext.procedureId != null
+                            ? String(sessionContext.procedureId)
+                            : name === 'step_number' && sessionContext.stepNumber != null
+                              ? String(sessionContext.stepNumber)
+                              : name === 'cumulative_session_time_s' &&
+                                  sessionContext.cumulativeSessionTimeS != null
+                                ? String(formatNum(sessionContext.cumulativeSessionTimeS, 3))
+                                : '—'}
                       </td>
                     </tr>
                   ))}

@@ -5,6 +5,7 @@ import { getProcedureByTrain } from '../data/procedures';
 import { appendCompletedSession } from '../data/analyticsStorage';
 import { getStepFeedback, getWorkloadLevel } from '../data/stepFeedback';
 import {
+  ensureStoredStreamId,
   getStoredStreamId,
   isStreamingIntegrationEnabled,
   streamingSessionStart,
@@ -58,9 +59,13 @@ const SessionView = () => {
   const [streamingHookReady, setStreamingHookReady] = useState(false);
 
   useEffect(() => {
-    const enabled = typeof window !== 'undefined' && isStreamingIntegrationEnabled();
-    const sid = typeof window !== 'undefined' ? getStoredStreamId().trim() : '';
-    if (!enabled || !sid || !procedure) {
+    if (!procedure || typeof window === 'undefined') {
+      setStreamingHookReady(false);
+      return undefined;
+    }
+    const enabled = isStreamingIntegrationEnabled();
+    const sid = ensureStoredStreamId(procedure.id, trainNumber).trim();
+    if (!enabled || !sid) {
       setStreamingHookReady(false);
       return undefined;
     }
@@ -101,8 +106,9 @@ const SessionView = () => {
   }, [procedure?.id, trainNumber]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    const enabled = typeof window !== 'undefined' && isStreamingIntegrationEnabled();
-    const sid = typeof window !== 'undefined' ? getStoredStreamId().trim() : '';
+    if (!procedure || typeof window === 'undefined') return undefined;
+    const enabled = isStreamingIntegrationEnabled();
+    const sid = ensureStoredStreamId(procedure.id, trainNumber).trim();
     if (!enabled || !sid || !procedure?.steps?.length || !streamingHookReady) {
       return undefined;
     }

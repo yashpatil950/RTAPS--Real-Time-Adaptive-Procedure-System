@@ -137,11 +137,47 @@ export function setStoredStreamId(id) {
   }
 }
 
+/** Safe fragment for stream_id (must stay aligned with Pupil bridge `--stream_id`). */
+function sanitizeStreamPart(raw) {
+  return String(raw ?? '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .slice(0, 48);
+}
+
+/**
+ * If no stream ID is saved yet, derive one from participant + procedure so
+ * `/session/:id` sync can reach the backend without visiting Live ML first.
+ * Operators should match Pupil Capture bridge `--stream_id` to this value (or set ID manually).
+ */
+export function ensureStoredStreamId(procedureId, trainNumber) {
+  let sid = getStoredStreamId().trim();
+  if (sid) return sid;
+  try {
+    const u = JSON.parse(localStorage.getItem('currentParticipant') || '{}');
+    const participantSlug =
+      u.role === 'admin'
+        ? 'admin'
+        : sanitizeStreamPart(u.id ?? u.username ?? 'participant');
+    sid = `RTAPS_${participantSlug}_P${sanitizeStreamPart(procedureId)}_T${sanitizeStreamPart(trainNumber)}`;
+    setStoredStreamId(sid);
+    return sid;
+  } catch (_) {
+    sid = `RTAPS_P${procedureId}_T${trainNumber}_${Date.now()}`;
+    setStoredStreamId(sid);
+    return sid;
+  }
+}
+
 export function isStreamingIntegrationEnabled() {
   try {
-    return localStorage.getItem(STORAGE_STREAMING_ENABLED) === '1';
+    const v = localStorage.getItem(STORAGE_STREAMING_ENABLED);
+    // Default ON so procedure pages sync unless the operator explicitly disables it.
+    if (v === null || v === '') return true;
+    return v === '1';
   } catch (_) {
-    return false;
+    return true;
   }
 }
 

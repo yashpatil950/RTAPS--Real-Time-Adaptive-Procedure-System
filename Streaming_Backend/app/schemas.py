@@ -43,7 +43,7 @@ class BlinkEvent(BaseModel):
 class FixationEvent(BaseModel):
     start_timestamp: float = Field(..., description="Pupil clock, fixation onset (s)")
     duration: float = Field(..., ge=0.0, description="Duration in seconds")
-    dispersion: float = Field(..., ge=0.0, description="Dispersion in degrees")
+    dispersion: float = Field(default=0.0, ge=0.0, description="Dispersion in degrees")
     norm_x: float = Field(default=0.5, description="Normalized x in [0, 1]")
     norm_y: float = Field(default=0.5, description="Normalized y in [0, 1]")
 

@@ -142,9 +142,14 @@ class InferenceLoop:
                 expected_pupil_rate_hz_per_eye=settings.expected_pupil_rate_hz_per_eye,
                 min_data_yield=settings.min_data_yield,
             )
+            proc_id = int(st.procedure_id)
+            step_num = int(st.step_number)
+            stream_id = st.stream_id
 
+        # Do not hold session lock during model / HTTP inference — blocks pupil & fixation ingress.
+        try:
             if settings.fargate_inference_url:
-                label, proba = await predict_remote(st.stream_id, decision_t, features)
+                label, proba = await predict_remote(stream_id, decision_t, features)
                 source = "remote"
             else:
                 if self._predictor is None:
@@ -152,24 +157,28 @@ class InferenceLoop:
                     return
                 label, proba = self._predictor.predict(features)
                 source = "local"
+        except Exception:
+            log.exception("Inference failed for stream %s", stream_id)
+            return
 
-            prediction: dict = {
-                "stream_id": st.stream_id,
-                "decision_time": decision_t,
-                "procedure_id": int(st.procedure_id),
-                "step_number": int(st.step_number),
-                "cumulative_session_time_s": float(cumulative),
-                "workload_label": label,
-                "workload_proba": proba,
-                "feature_values": features,
-                "inference_source": source,
-                "is_valid_window": bool(is_valid),
-                "notes": None if is_valid else "low data yield in window — prediction may be unreliable",
-                "qa": qa,
-            }
+        prediction: dict = {
+            "stream_id": stream_id,
+            "decision_time": decision_t,
+            "procedure_id": proc_id,
+            "step_number": step_num,
+            "cumulative_session_time_s": float(cumulative),
+            "workload_label": label,
+            "workload_proba": proba,
+            "feature_values": features,
+            "inference_source": source,
+            "is_valid_window": bool(is_valid),
+            "notes": None if is_valid else "low data yield in window — prediction may be unreliable",
+            "qa": qa,
+        }
+
+        async with st.lock:
             st.last_prediction = prediction
             st.latest_prediction_at_wall = time.time()
 
-        # Publish outside the per-session lock so slow consumers don't block ingress.
-        self._publish_sse(st.stream_id, prediction)
+        self._publish_sse(stream_id, prediction)
         await push_prediction_webhook(prediction)
