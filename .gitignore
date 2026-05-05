@@ -1,0 +1,30 @@
+# --- OS & editors -----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Environment & secrets --------------------------------------------------
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- Python (monorepo root + e.g. Streaming_Backend) -----------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Logs & temp ------------------------------------------------------------
+*.log
+tmp/
+temp/
