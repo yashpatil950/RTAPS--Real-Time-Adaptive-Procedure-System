@@ -1,0 +1,25 @@
+session_uid,procedure_slug,pupil_source,pupil_n_rows,pupil_n_eye0,pupil_n_eye1,pupil_rate_hz_eye0,pupil_rate_hz_eye1,pupil_baseline_mm_eye0,pupil_baseline_mm_eye1,pupil_baseline_mm_mean,fixations_n,blinks_n,blinks_n_tracking_loss,gaze_n,notes
+lenovo__211__centrifuge,centrifuge,,0,0,0,0.0,0.0,,,,4776,0,0,0,no usable pupil source
+lenovo__222__column_flushing,column_flushing,,0,0,0,0.0,0.0,,,,1867,55,8,0,no usable pupil source
+lenovo__223__pressure_testing,pressure_testing,offline,87593,45842,41751,60.38,54.99,4.1236535077831125,3.79198788594014,3.957820696861626,2271,61,11,87592,
+lenovo__231__centrifuge,centrifuge,streaming,103362,50172,53190,59.21,62.77,3.19452045369427,3.1411480147463906,3.1678342342203303,2938,306,6,0,
+lenovo__232__column_flushing,column_flushing,offline,56592,27362,29230,64.11,68.48,2.813731356028784,3.4481487293352764,3.13094004268203,1533,104,6,56589,
+lenovo__233__pressure_testing,pressure_testing,offline,37571,15465,22106,34.08,48.72,3.2826952532602927,3.5964701390614673,3.4395826961608797,1137,89,10,37570,
+lenovo__241__centrifuge,centrifuge,offline,118950,59511,59439,62.64,62.57,2.6748733277784753,2.881357186466045,2.77811525712226,3195,473,12,118950,
+lenovo__242__column_flushing,column_flushing,offline,38311,16140,22171,45.75,62.8,2.589083809262821,3.1255481502556983,2.8573159797592593,0,0,0,0,
+lenovo__243__pressure_testing,pressure_testing,offline,32697,13467,19230,36.56,52.21,2.6495025887751544,3.521522339191994,3.0855124639835743,933,95,12,32697,
+lenovo__252__column_flushing,column_flushing,offline,60720,30690,30030,69.08,67.59,3.9147573196935275,2.3775475548381437,3.146152437265836,1527,35,8,60721,
+zahabi__311__centrifuge,centrifuge,offline,238630,127061,111569,77.5,68.05,4.2158588169075895,6.300741515339891,5.258300166123741,5179,114,57,0,
+zahabi__321__centrifuge,centrifuge,,0,0,0,0.0,0.0,,,,3873,146,68,0,no usable pupil source
+zahabi__331__centrifuge,centrifuge,offline,302875,158421,144454,64.44,58.75,1.3606967398222145,1.7524247056735245,1.5565607227478695,4202,0,0,0,
+zahabi__341__centrifuge,centrifuge,offline,232851,145703,87148,67.27,40.23,2.1626773489465063,1.4593604704542498,1.811018909700378,2912,383,149,0,
+zahabi__351__centrifuge,centrifuge,,0,0,0,0.0,0.0,,,,3428,231,50,0,no usable pupil source
+zahabi__352__column_flushing,column_flushing,,0,0,0,0.0,0.0,,,,1077,79,10,0,no usable pupil source
+zahabi__353__pressure_testing,pressure_testing,offline,100590,48721,51869,64.16,68.31,3.0971979557868816,3.4637928626541066,3.280495409220494,2221,0,0,100588,
+zahabi__361__centrifuge,centrifuge,,0,0,0,0.0,0.0,,,,2939,240,48,0,no usable pupil source
+zahabi__362__column_flushing,column_flushing,offline,46220,23252,22968,97.64,96.45,3.195572693724823,3.077567587252907,3.136570140488865,938,74,11,46219,
+loaner__312__column_flushing,column_flushing,,0,0,0,0.0,0.0,,,,1003,76,25,0,no usable pupil source
+loaner__332__column_flushing,column_flushing,offline,26992,14558,12434,38.05,32.53,2.190391902463938,2.157687136864572,2.174039519664255,1303,47,22,26986,
+loaner__333__pressure_testing,pressure_testing,offline,28523,12005,16518,23.89,32.87,1.9981720861578027,2.3654900163365347,2.1818310512471686,1439,66,19,28520,
+loaner__342__column_flushing,column_flushing,offline,18983,11427,7556,40.72,26.94,2.043064317598177,1.5628248938809175,1.802944605739547,1015,35,9,18980,
+loaner__S001T001__unknown,,,0,0,0,0.0,0.0,,,,0,0,0,0,skipped: no procedure_slug (UNMATCHED row)

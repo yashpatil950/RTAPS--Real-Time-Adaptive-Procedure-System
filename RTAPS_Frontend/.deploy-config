@@ -1,0 +1,15 @@
+ROLE_ARN=arn:aws:iam::275688773720:role/rtaps-lambda-role
+REGION=us-east-1
+USERS_LAMBDA_ARN=arn:aws:lambda:us-east-1:275688773720:function:rtaps-users
+SESSIONS_LAMBDA_ARN=arn:aws:lambda:us-east-1:275688773720:function:rtaps-sessions
+API_ID=1fvmmxvjr4
+API_URL=https://1fvmmxvjr4.execute-api.us-east-1.amazonaws.com/prod
+BUCKET_NAME=rtaps-app-1764027685
+S3_WEBSITE_URL=http://rtaps-app-1764027685.s3-website.us-east-1.amazonaws.com
+DIST_ID=E3DBMKT1T6H26V
+DIST_DOMAIN=d1wnytfqv27wgo.cloudfront.net
+CLOUDFRONT_URL=https://d1wnytfqv27wgo.cloudfront.net
+USERS_LAMBDA_ARN=
+SESSIONS_LAMBDA_ARN=
+USERS_LAMBDA_ARN=arn:aws:lambda:us-east-1:275688773720:function:rtaps-users
+SESSIONS_LAMBDA_ARN=arn:aws:lambda:us-east-1:275688773720:function:rtaps-sessions

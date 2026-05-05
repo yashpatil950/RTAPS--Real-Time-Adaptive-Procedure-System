@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom styles for tablet optimization */
+@layer components {
+  .tablet-button {
+    @apply px-6 py-3 text-lg font-medium rounded-lg shadow-md transition-all duration-200;
+    @apply hover:shadow-lg active:scale-95;
+    min-height: 48px;
+  }
+  
+  .tablet-card {
+    @apply bg-white rounded-xl shadow-lg p-6;
+    @apply border border-gray-200;
+  }
+  
+  .tablet-input {
+    @apply w-full px-4 py-3 text-lg border border-gray-300 rounded-lg;
+    @apply focus:ring-2 focus:ring-blue-500 focus:border-transparent;
+    min-height: 48px;
+  }
+  
+  .step-item {
+    @apply bg-white rounded-lg p-4 mb-3 border-l-4;
+    @apply transition-all duration-200 hover:shadow-md;
+  }
+  
+  .step-active {
+    @apply border-l-blue-500 bg-blue-50;
+  }
+  
+  .step-completed {
+    @apply border-l-green-500 bg-green-50;
+  }
+  
+  .step-expanded {
+    @apply border-l-purple-500 bg-purple-50;
+  }
+  
+  .gaze-indicator {
+    @apply absolute w-4 h-4 bg-red-500 rounded-full;
+    @apply border-2 border-white shadow-lg;
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Custom scrollbar for webkit browsers */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

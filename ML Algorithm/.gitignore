@@ -1,0 +1,25 @@
+# --- Raw participant data (huge, IRB-controlled) -----------------------------
+data/Dr_Zahabi_laptop/
+data/Lenovo_laptop/
+data/Loaner_laptop/
+
+# # --- Derived parquets (regenerable from raw via scripts/) --------------------
+# # Keep the small QA CSVs and the feature dictionary; ignore the heavy artifacts.
+# data/_processed/**/*.parquet
+# data/_processed/**/per_session/
+
+# --- Python ------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- macOS / editors ---------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+
+# --- Misc --------------------------------------------------------------------
+*.log

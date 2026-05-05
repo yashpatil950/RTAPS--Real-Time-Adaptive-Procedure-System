@@ -1,0 +1,37 @@
+procedure_id,procedure_name,procedure_slug,step_id,step_number,time_threshold_s
+1,Centrifuge,centrifuge,1,1,43.0
+1,Centrifuge,centrifuge,2,2,80.0
+1,Centrifuge,centrifuge,6,3,559.0
+1,Centrifuge,centrifuge,11,4,68.0
+1,Centrifuge,centrifuge,12,5,298.0
+1,Centrifuge,centrifuge,13,6,49.0
+1,Centrifuge,centrifuge,14,7,42.0
+1,Centrifuge,centrifuge,15,8,4.0
+2,Column Flushing,column_flushing,20,1,27.0
+2,Column Flushing,column_flushing,21,2,14.0
+2,Column Flushing,column_flushing,22,3,10.0
+2,Column Flushing,column_flushing,23,4,10.0
+2,Column Flushing,column_flushing,24,5,51.0
+2,Column Flushing,column_flushing,25,6,46.0
+2,Column Flushing,column_flushing,26,7,75.0
+2,Column Flushing,column_flushing,27,8,93.0
+2,Column Flushing,column_flushing,31,9,23.0
+2,Column Flushing,column_flushing,32,10,35.0
+2,Column Flushing,column_flushing,33,11,33.0
+2,Column Flushing,column_flushing,34,12,13.0
+2,Column Flushing,column_flushing,35,13,69.0
+2,Column Flushing,column_flushing,36,14,73.0
+3,Pressure Testing,pressure_testing,41,1,34.0
+3,Pressure Testing,pressure_testing,42,2,104.0
+3,Pressure Testing,pressure_testing,43,3,111.0
+3,Pressure Testing,pressure_testing,44,4,124.0
+3,Pressure Testing,pressure_testing,45,5,398.0
+3,Pressure Testing,pressure_testing,50,6,221.0
+3,Pressure Testing,pressure_testing,51,7,66.0
+3,Pressure Testing,pressure_testing,52,8,32.0
+3,Pressure Testing,pressure_testing,53,9,170.0
+3,Pressure Testing,pressure_testing,54,10,33.0
+3,Pressure Testing,pressure_testing,55,11,24.0
+3,Pressure Testing,pressure_testing,56,12,27.0
+3,Pressure Testing,pressure_testing,57,13,21.0
+3,Pressure Testing,pressure_testing,58,14,21.0
