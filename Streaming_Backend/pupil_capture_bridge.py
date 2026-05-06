@@ -260,7 +260,8 @@ def main() -> int:
     log.info("Subscribed to SUB port %s", sub_port)
     # Prefix subscriptions — Pupil envelope topics vary by release.
     # Use `blink` / `fixation` prefixes so both singular and plural topic names match.
-    for topic in ("pupil.", "blink", "fixation"):
+    # `notify.` is required for notification-shaped IPC messages (docs vs some builds use these).
+    for topic in ("pupil.", "blink", "fixation", "notify."):
         sub.setsockopt_string(zmq.SUBSCRIBE, topic)
 
     batcher = PupilBatcher(
@@ -285,33 +286,40 @@ def main() -> int:
                 # First frame after topic is always msgpack dict; extra frames are raw attachments.
                 payload_raw = parts[1]
                 payload = _unpack_payload(payload_raw)
+                inner_topic = payload.get("topic")
+                if isinstance(inner_topic, bytes):
+                    inner_topic = inner_topic.decode("utf-8", errors="replace")
+                elif inner_topic is not None and not isinstance(inner_topic, str):
+                    inner_topic = str(inner_topic)
                 if args.verbose and (
                     "fixat" in topic_str.lower()
-                    or payload.get("topic") in ("fixation", "fixations")
+                    or inner_topic in ("fixation", "fixations")
                     or (
                         isinstance(payload.get("subject"), str)
                         and "fixat" in payload["subject"].lower()
                     )
                 ):
                     log.debug(
-                        "zmq topic=%r frames=%d payload_keys=%s",
+                        "zmq topic=%r frames=%d payload.topic=%r payload_keys=%s",
                         topic_str,
                         len(parts),
+                        inner_topic,
                         sorted(payload.keys()),
                     )
+                # Prefer payload["topic"] for fixation datums — envelope string can differ by Pupil version.
+                fixation_inner = inner_topic in ("fixation", "fixations")
                 if topic_str.startswith("pupil"):
                     batcher.add(payload)
+                elif fixation_inner:
+                    _handle_fixation(ctx, payload)
                 elif topic_str.startswith("blink"):
                     _handle_blink(ctx, payload)
                 elif topic_str.startswith("fixation"):
                     _handle_fixation(ctx, payload)
                 elif topic_str.startswith("notify."):
-                    # Notifications use envelope ``notify.<subject>``; datum may repeat inner ``topic``.
-                    it = payload.get("topic")
+                    # Notifications use envelope ``notify.<subject>``; some builds encode fixation-like datums here.
                     subj = payload.get("subject")
-                    if it in ("fixation", "fixations"):
-                        _handle_fixation(ctx, payload)
-                    elif isinstance(subj, str) and "fixation" in subj.lower() and payload.get("start_timestamp") is not None:
+                    if isinstance(subj, str) and "fixation" in subj.lower() and payload.get("start_timestamp") is not None:
                         _handle_fixation(ctx, payload)
             batcher.maybe_flush()
     except KeyboardInterrupt:

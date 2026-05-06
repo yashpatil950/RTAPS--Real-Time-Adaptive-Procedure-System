@@ -46,16 +46,16 @@ can responsibly support ~5–10 features, not 48.
 
 ## 3. The 8 features
 
-| # | Feature | Source | What it measures | Why it's in |
-|---|---|---|---|---|
-| 1 | `pupil_pcps_mean` | pupil samples + per-session 60 s baseline | % change in pupil size vs. participant baseline | The canonical cognitive-load marker. Direct sympathetic-nervous-system response. Baseline-normalized so it's directly comparable across participants. |
-| 2 | `pupil_diam_slope` | pupil samples (diameter vs. timestamp) | Rate of pupil dilation/constriction within the 10 s window | Captures *dynamic* load changes (pupil rising = load increasing), complementary to the level. |
-| 3 | `blink_rate_per_min` | blink onset events | Blinks per minute (excluding tracking-loss blinks) | Cognitive blink suppression — well-validated workload marker; rate drops measurably under load. |
-| 4 | `fixation_dur_mean_ms` | fixation events | Mean fixation duration (ms) | Long fixations indicate deeper visual processing / difficulty extracting information. |
-| 5 | `fixation_dispersion_mean` | fixation events | Within-fixation spatial jitter | Proxy for fixation quality and visual-attention stability. |
-| 6 | `procedure_id` | RTAPS UI state | Which procedure is active (1=Centrifuge, 2=Column Flushing, 3=Pressure Testing) | Lets the model adjust feature interpretation per-procedure (e.g. baseline pupil dynamics differ across procedures). |
-| 7 | `step_number` | RTAPS UI state | Current step ordinal within the procedure | Lets the model learn step-specific patterns (some steps are inherently busier than others). |
-| 8 | `cumulative_session_time_s` | session start timestamp | Seconds since the procedure started | Captures fatigue accumulating across a long session. |
+| # | Feature | Short meaning | Source | What it measures | Why it's in |
+|---|---|---|---|---|---|
+| 1 | `pupil_pcps_mean` | How dilated the pupil is versus that person's own first-minute calm size | pupil samples + per-session 60 s baseline | % change in pupil size vs. participant baseline | The canonical cognitive-load marker. Direct sympathetic-nervous-system response. Baseline-normalized so it's directly comparable across participants. |
+| 2 | `pupil_diam_slope` | Whether pupil size is trending up or down over the last ~10 s | pupil samples (diameter vs. timestamp) | Rate of pupil dilation/constriction within the 10 s window | Captures *dynamic* load changes (pupil rising = load increasing), complementary to the level. |
+| 3 | `blink_rate_per_min` | How often the person blinks (normal blinks only) | blink onset events | Blinks per minute (excluding tracking-loss blinks) | Cognitive blink suppression — well-validated workload marker; rate drops measurably under load. |
+| 4 | `fixation_dur_mean_ms` | How long they typically stay fixed on one gaze point | fixation events | Mean fixation duration (ms) | Long fixations indicate deeper visual processing / difficulty extracting information. |
+| 5 | `fixation_dispersion_mean` | How shaky or tight gaze stays during each fixation | fixation events | Within-fixation spatial jitter | Proxy for fixation quality and visual-attention stability. |
+| 6 | `procedure_id` | Which procedure template is running | RTAPS UI state | Which procedure is active (1=Centrifuge, 2=Column Flushing, 3=Pressure Testing) | Lets the model adjust feature interpretation per-procedure (e.g. baseline pupil dynamics differ across procedures). |
+| 7 | `step_number` | How far they are through the checklist | RTAPS UI state | Current step ordinal within the procedure | Lets the model learn step-specific patterns (some steps are inherently busier than others). |
+| 8 | `cumulative_session_time_s` | Session clock — how long they've been on task | session start timestamp | Seconds since the procedure started | Captures fatigue accumulating across a long session. |
 
 ### Per-feature rationale and citations
 
