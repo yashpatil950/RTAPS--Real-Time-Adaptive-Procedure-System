@@ -11,8 +11,16 @@ emits confidence-filtered parquets:
       gaze_clean.parquet          (synced_t, unix_t, norm_pos_x, norm_pos_y, confidence)
 
 Plus aggregate artifacts:
-  _processed/baselines.csv        per-session pupil baseline (mean diameter in first 60 s)
+  _processed/baselines.csv        per-session pupil baseline (quietest-60s window strategy)
   _processed/data_quality.csv     per-session sample counts, rates, yields, missing files
+
+Pupil baseline strategy (Phase 1 fix):
+  Instead of "mean of first 120 s" (which often captures the busy 'Prep to start
+  task' period — VACP=170.1 for column_flushing!), we scan the session in 120 s
+  rolling windows and pick the QUIETEST window (lowest blinks + fixations) that
+  has at least 120 high-confidence pupil samples. The baseline is the mean
+  pupil diameter inside that window. If no candidate window meets the data
+  threshold, we fall back to the session-wide median.
 
 Pupil sample sourcing:
   - prefer offline export (`pupil_positions.csv`, pye3d only)
@@ -34,7 +42,6 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.config import (  # noqa: E402
-    BASELINE_DURATION_S,
     BLINK_TRACKING_LOSS_S,
     MIN_CONFIDENCE,
     PROCESSED_ROOT,
@@ -259,6 +266,13 @@ class CleanReport:
     pupil_baseline_mm_eye0: float = float("nan")
     pupil_baseline_mm_eye1: float = float("nan")
     pupil_baseline_mm_mean: float = float("nan")
+    # Phase 1: quiet-window baseline metadata
+    baseline_strategy: str = ""
+    baseline_window_start_synced_t: float = float("nan")
+    baseline_window_end_synced_t: float = float("nan")
+    baseline_window_n_blinks: int = 0
+    baseline_window_n_fixations: int = 0
+    baseline_window_n_pupil: int = 0
     fixations_n: int = 0
     blinks_n: int = 0
     blinks_n_tracking_loss: int = 0
@@ -281,19 +295,99 @@ def _write_parquet(path: Path, df: pd.DataFrame) -> None:
     df.to_parquet(path, index=False)
 
 
-def _compute_baseline(pupil: pd.DataFrame, anchor: ClockAnchor) -> tuple[float, float]:
-    """Return (baseline_eye0_mm, baseline_eye1_mm) from the first BASELINE_DURATION_S."""
+QUIET_WINDOW_S = 120.0
+QUIET_STRIDE_S = 30.0
+QUIET_MIN_PUPIL_SAMPLES = 120  # ≥ 1s worth of confident samples per window (scaled with window)
+
+
+def _compute_baseline(
+    pupil: pd.DataFrame,
+    blinks: pd.DataFrame | None,
+    fixations: pd.DataFrame | None,
+    anchor: ClockAnchor,
+) -> tuple[float, float, dict]:
+    """Phase 1 baseline: pupil mean over the *quietest* 120 s window in the session.
+
+    "Quietest" = the 120-second window with the smallest combined blink + fixation
+    count, among windows with at least QUIET_MIN_PUPIL_SAMPLES high-confidence
+    pupil samples. Falls back to session-median if no qualifying window exists.
+
+    Returns (baseline_eye0_mm, baseline_eye1_mm, metadata_dict).
+    """
     if pupil.empty:
-        return float("nan"), float("nan")
-    cutoff = anchor.synced_at_pupil_start + BASELINE_DURATION_S
-    early = pupil[pupil["synced_t"] <= cutoff]
-    if early.empty:
-        return float("nan"), float("nan")
-    e0 = early[early["eye_id"] == 0]["diameter_mm"]
-    e1 = early[early["eye_id"] == 1]["diameter_mm"]
+        return float("nan"), float("nan"), {"strategy": "empty"}
+
+    t_start = float(anchor.synced_at_pupil_start)
+    t_end = t_start + float(anchor.pupil_duration_s or 0.0)
+    if t_end <= t_start:
+        # session_index didn't tell us duration → infer from pupil samples themselves
+        t_end = float(pupil["synced_t"].max())
+
+    blink_starts = np.array([], dtype=float)
+    if blinks is not None and len(blinks):
+        valid = blinks
+        if "tracking_loss" in valid.columns:
+            valid = valid.loc[~valid["tracking_loss"].astype(bool)]
+        blink_starts = valid["start_synced_t"].to_numpy(dtype=float)
+
+    fix_starts = (
+        fixations["start_synced_t"].to_numpy(dtype=float)
+        if fixations is not None and len(fixations)
+        else np.array([], dtype=float)
+    )
+    pupil_t = pupil["synced_t"].to_numpy(dtype=float)
+
+    if t_end - t_start < QUIET_WINDOW_S:
+        # Session shorter than the quiet window — use the session median
+        e0 = pupil[pupil["eye_id"] == 0]["diameter_mm"]
+        e1 = pupil[pupil["eye_id"] == 1]["diameter_mm"]
+        return (
+            float(e0.median()) if len(e0) else float("nan"),
+            float(e1.median()) if len(e1) else float("nan"),
+            {"strategy": "session_median_short"},
+        )
+
+    best = None  # (score, w_lo, w_hi, n_blinks, n_fix, n_pupil)
+    cur = t_start
+    n_candidates = 0
+    while cur + QUIET_WINDOW_S <= t_end + 1e-6:
+        w_lo, w_hi = cur, cur + QUIET_WINDOW_S
+        n_pupil = int(np.sum((pupil_t >= w_lo) & (pupil_t < w_hi)))
+        if n_pupil >= QUIET_MIN_PUPIL_SAMPLES:
+            n_blinks = int(np.sum((blink_starts >= w_lo) & (blink_starts < w_hi))) if blink_starts.size else 0
+            n_fix = int(np.sum((fix_starts >= w_lo) & (fix_starts < w_hi))) if fix_starts.size else 0
+            score = n_blinks + n_fix
+            if best is None or score < best[0]:
+                best = (score, w_lo, w_hi, n_blinks, n_fix, n_pupil)
+            n_candidates += 1
+        cur += QUIET_STRIDE_S
+
+    if best is None:
+        # No window had enough pupil samples — fall back to session-median
+        e0 = pupil[pupil["eye_id"] == 0]["diameter_mm"]
+        e1 = pupil[pupil["eye_id"] == 1]["diameter_mm"]
+        return (
+            float(e0.median()) if len(e0) else float("nan"),
+            float(e1.median()) if len(e1) else float("nan"),
+            {"strategy": "session_median_fallback", "n_candidates": n_candidates},
+        )
+
+    _, w_lo, w_hi, n_b, n_f, n_p = best
+    sub = pupil[(pupil["synced_t"] >= w_lo) & (pupil["synced_t"] < w_hi)]
+    e0 = sub[sub["eye_id"] == 0]["diameter_mm"]
+    e1 = sub[sub["eye_id"] == 1]["diameter_mm"]
     return (
         float(e0.mean()) if len(e0) else float("nan"),
         float(e1.mean()) if len(e1) else float("nan"),
+        {
+            "strategy": "quietest_window",
+            "window_start_synced_t": float(w_lo),
+            "window_end_synced_t": float(w_hi),
+            "n_blinks": int(n_b),
+            "n_fixations": int(n_f),
+            "n_pupil_samples": int(n_p),
+            "n_candidates": n_candidates,
+        },
     )
 
 
@@ -352,6 +446,7 @@ def _process_session(row: pd.Series, processed_root: Path) -> CleanReport:
 
     out_dir = processed_root / rep.procedure_slug / "per_session" / rep.session_uid
 
+    # Step A: clean pupil samples
     pupil, source = _resolve_pupil(row, anchor)
     if pupil is not None:
         pupil = pupil.sort_values("synced_t").reset_index(drop=True)
@@ -367,31 +462,45 @@ def _process_session(row: pd.Series, processed_root: Path) -> CleanReport:
             if n >= 2:
                 dur = float(sub["synced_t"].max() - sub["synced_t"].min())
                 setattr(rep, f"pupil_rate_hz_eye{eid}", round(n / dur, 2) if dur > 0 else 0.0)
-        b0, b1 = _compute_baseline(pupil, anchor)
+    else:
+        rep.notes.append("no usable pupil source")
+
+    # Step B: clean fixations (needed for baseline scoring)
+    fix_df = None
+    if row.get("pupil_export_dir") and row.get("files_fixations") in (True, "True", "true"):
+        fix_path = Path(str(row["pupil_export_dir"])) / "fixations.csv"
+        if fix_path.is_file():
+            fix_df = _clean_fixations(fix_path, anchor)
+            if fix_df is not None and not fix_df.empty:
+                _write_parquet(out_dir / "fixations_clean.parquet", fix_df)
+                rep.fixations_n = len(fix_df)
+
+    # Step C: clean blinks (needed for baseline scoring)
+    bl_df = None
+    if row.get("pupil_export_dir") and row.get("files_blinks") in (True, "True", "true"):
+        bl_path = Path(str(row["pupil_export_dir"])) / "blinks.csv"
+        if bl_path.is_file():
+            bl_df = _clean_blinks(bl_path, anchor)
+            if bl_df is not None and not bl_df.empty:
+                _write_parquet(out_dir / "blinks_clean.parquet", bl_df)
+                rep.blinks_n = len(bl_df)
+                rep.blinks_n_tracking_loss = int(bl_df["tracking_loss"].sum())
+
+    # Step D: compute baseline using pupil + fixations + blinks (Phase 1 fix)
+    if pupil is not None and not pupil.empty:
+        b0, b1, meta = _compute_baseline(pupil, bl_df, fix_df, anchor)
         rep.pupil_baseline_mm_eye0 = b0
         rep.pupil_baseline_mm_eye1 = b1
         if not (np.isnan(b0) and np.isnan(b1)):
             rep.pupil_baseline_mm_mean = float(np.nanmean([b0, b1]))
-    else:
-        rep.notes.append("no usable pupil source")
+        rep.baseline_strategy = str(meta.get("strategy", ""))
+        rep.baseline_window_start_synced_t = float(meta.get("window_start_synced_t", float("nan")))
+        rep.baseline_window_end_synced_t = float(meta.get("window_end_synced_t", float("nan")))
+        rep.baseline_window_n_blinks = int(meta.get("n_blinks", 0))
+        rep.baseline_window_n_fixations = int(meta.get("n_fixations", 0))
+        rep.baseline_window_n_pupil = int(meta.get("n_pupil_samples", 0))
 
-    if row.get("pupil_export_dir") and row.get("files_fixations") in (True, "True", "true"):
-        fix_path = Path(str(row["pupil_export_dir"])) / "fixations.csv"
-        if fix_path.is_file():
-            fix = _clean_fixations(fix_path, anchor)
-            if fix is not None and not fix.empty:
-                _write_parquet(out_dir / "fixations_clean.parquet", fix)
-                rep.fixations_n = len(fix)
-
-    if row.get("pupil_export_dir") and row.get("files_blinks") in (True, "True", "true"):
-        bl_path = Path(str(row["pupil_export_dir"])) / "blinks.csv"
-        if bl_path.is_file():
-            bl = _clean_blinks(bl_path, anchor)
-            if bl is not None and not bl.empty:
-                _write_parquet(out_dir / "blinks_clean.parquet", bl)
-                rep.blinks_n = len(bl)
-                rep.blinks_n_tracking_loss = int(bl["tracking_loss"].sum())
-
+    # Step E: clean gaze (independent of baseline)
     if row.get("pupil_export_dir") and row.get("files_gaze_positions") in (True, "True", "true"):
         gz_path = Path(str(row["pupil_export_dir"])) / "gaze_positions.csv"
         if gz_path.is_file():
@@ -446,8 +555,13 @@ def main(argv: list[str] | None = None) -> int:
     dq.to_csv(dq_path, index=False)
 
     bl = dq[
-        ["session_uid", "procedure_slug", "pupil_baseline_mm_eye0",
-         "pupil_baseline_mm_eye1", "pupil_baseline_mm_mean"]
+        [
+            "session_uid", "procedure_slug",
+            "pupil_baseline_mm_eye0", "pupil_baseline_mm_eye1", "pupil_baseline_mm_mean",
+            "baseline_strategy",
+            "baseline_window_start_synced_t", "baseline_window_end_synced_t",
+            "baseline_window_n_blinks", "baseline_window_n_fixations", "baseline_window_n_pupil",
+        ]
     ].copy()
     bl_path = args.processed_root / "baselines.csv"
     bl.to_csv(bl_path, index=False)

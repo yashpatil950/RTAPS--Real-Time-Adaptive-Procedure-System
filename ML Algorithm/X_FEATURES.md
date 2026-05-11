@@ -26,7 +26,7 @@ them to drive the UI feedback (out of scope here).
 ## 2. Design principles for choosing features
 
 The 48-feature first cut was a "kitchen-sink" extraction. We pruned aggressively
-to 8 features using four rules:
+to 7 features using four rules:
 
 1. **Real, measured data only.** No synthetic, proxy, or imputed values. Every
    feature must trace to a sensor reading or a UI event recorded during the
@@ -44,36 +44,36 @@ can responsibly support ~5–10 features, not 48.
 
 ---
 
-## 3. The 8 features
+## 3. The 7 features
 
 | # | Feature | Short meaning | Source | What it measures | Why it's in |
 |---|---|---|---|---|---|
-| 1 | `pupil_pcps_mean` | How dilated the pupil is versus that person's own first-minute calm size | pupil samples + per-session 60 s baseline | % change in pupil size vs. participant baseline | The canonical cognitive-load marker. Direct sympathetic-nervous-system response. Baseline-normalized so it's directly comparable across participants. |
-| 2 | `pupil_diam_slope` | Whether pupil size is trending up or down over the last ~10 s | pupil samples (diameter vs. timestamp) | Rate of pupil dilation/constriction within the 10 s window | Captures *dynamic* load changes (pupil rising = load increasing), complementary to the level. |
-| 3 | `blink_rate_per_min` | How often the person blinks (normal blinks only) | blink onset events | Blinks per minute (excluding tracking-loss blinks) | Cognitive blink suppression — well-validated workload marker; rate drops measurably under load. |
-| 4 | `fixation_dur_mean_ms` | How long they typically stay fixed on one gaze point | fixation events | Mean fixation duration (ms) | Long fixations indicate deeper visual processing / difficulty extracting information. |
-| 5 | `fixation_dispersion_mean` | How shaky or tight gaze stays during each fixation | fixation events | Within-fixation spatial jitter | Proxy for fixation quality and visual-attention stability. |
-| 6 | `procedure_id` | Which procedure template is running | RTAPS UI state | Which procedure is active (1=Centrifuge, 2=Column Flushing, 3=Pressure Testing) | Lets the model adjust feature interpretation per-procedure (e.g. baseline pupil dynamics differ across procedures). |
-| 7 | `step_number` | How far they are through the checklist | RTAPS UI state | Current step ordinal within the procedure | Lets the model learn step-specific patterns (some steps are inherently busier than others). |
-| 8 | `cumulative_session_time_s` | Session clock — how long they've been on task | session start timestamp | Seconds since the procedure started | Captures fatigue accumulating across a long session. |
+| 1 | `pupil_pcps_mean` | How dilated the pupil is versus that person's own first-2-minute calm size | pupil samples + per-session 120 s baseline | % change in pupil size vs. participant baseline | The canonical cognitive-load marker. Direct sympathetic-nervous-system response. Baseline-normalized so it's directly comparable across participants. |
+| 2 | `blink_rate_per_min` | How often the person blinks (normal blinks only) | blink onset events | Blinks per minute (excluding tracking-loss blinks) | Cognitive blink suppression — well-validated workload marker; rate drops measurably under load. |
+| 3 | `fixation_dur_mean_ms` | How long they typically stay fixed on one gaze point | fixation events | Mean fixation duration (ms) | Long fixations indicate deeper visual processing / difficulty extracting information. |
+| 4 | `fixation_dispersion_mean` | How shaky or tight gaze stays during each fixation | fixation events | Within-fixation spatial jitter | Proxy for fixation quality and visual-attention stability. |
+| 5 | `procedure_id` | Which procedure template is running | RTAPS UI state | Which procedure is active (1=Centrifuge, 2=Column Flushing, 3=Pressure Testing) | Lets the model adjust feature interpretation per-procedure (e.g. baseline pupil dynamics differ across procedures). |
+| 6 | `step_number` | How far they are through the checklist | RTAPS UI state | Current step ordinal within the procedure | Lets the model learn step-specific patterns (some steps are inherently busier than others). |
+| 7 | `cumulative_session_time_s` | Session clock — how long they've been on task | session start timestamp | Seconds since the procedure started | Captures fatigue accumulating across a long session. |
 
 ### Per-feature rationale and citations
 
-**Pupil features (#1, #2).** Pupil dilation is the most-studied physiological
+**Pupil feature (#1).** Pupil dilation is the most-studied physiological
 indicator of cognitive workload; PCPS (Percent Change in Pupil Size relative to
 a baseline) controls for individual differences in resting pupil size, making
 it usable across participants without per-participant calibration in the model.
-Slope adds dynamic information that the 10-second mean alone hides.
+`pupil_diam_slope` was removed — the within-window trend added marginal
+signal at n < 10 participants and introduced noise at window boundaries.
 
-**Blink rate (#3).** Cognitive blink suppression is robust and easy to detect
+**Blink rate (#2).** Cognitive blink suppression is robust and easy to detect
 from blink-onset events. Tracking-loss blinks (>2 s) are explicitly excluded
 upstream so they don't inflate the rate.
 
-**Fixation features (#4, #5).** Fixation duration and dispersion together
+**Fixation features (#3, #4).** Fixation duration and dispersion together
 characterize the *depth* and *stability* of visual processing without depending
 on screen-coordinate semantics (no AOI mapping required).
 
-**Task context (#6, #7, #8).** Three discrete pieces of state the live system
+**Task context (#5, #6, #7).** Three discrete pieces of state the live system
 already knows about the user. They give the model just enough context to
 distinguish "third minute of step 1 of Centrifuge" from "third minute of step
 14 of Pressure Testing" — without leaking the label.
@@ -84,7 +84,8 @@ distinguish "third minute of step 1 of Centrifuge" from "third minute of step
 
 | Dropped | Reason |
 |---|---|
-| `pupil_diam_mean / median / iqr / range / mean_z / slope_z`, `pupil_eye_asymmetry`, `pupil_pcps_std` | Redundant with `pupil_pcps_mean` + `pupil_diam_slope`. Linear combinations that don't add information at this sample size. |
+| `pupil_diam_slope` | Within-window trend signal. Adds marginal information on top of `pupil_pcps_mean` at this sample size (< 10 participants), and introduces noise at window boundaries. Moved here from the active feature set. |
+| `pupil_diam_mean / median / iqr / range / mean_z / slope_z`, `pupil_eye_asymmetry`, `pupil_pcps_std` | Redundant with `pupil_pcps_mean`. Linear combinations that don't add information at this sample size. |
 | `blink_count`, `blink_dur_mean / std`, `blink_inter_interval_mean / cv`, `blink_long_count` | Mostly noisy at 10 s window scale (often 0–1 blinks per window → undefined statistics). Rate captures the load signal; the rest are duration/fatigue markers, not workload. |
 | `fixation_count`, `fixation_rate_per_sec`, `fixation_dur_std / median_ms`, `fixation_saccade_amp_mean`, `fixation_time_in_fixation_ratio` | Redundant with `fixation_dur_mean_ms`. Counts/rates are functions of the same underlying event stream. |
 | `gaze_n_samples`, `gaze_norm_x/y_mean/std`, `gaze_region_entropy`, `gaze_region_top1_ratio`, `gaze_transitions_per_sec` | Two reasons: (a) only 11/23 sessions have raw gaze; the fallback to fixation centroids creates a session-identification confound. (b) Without an Areas-of-Interest map (we don't have one), gaze location is procedure-content dependent, not workload dependent. |
@@ -106,17 +107,17 @@ distinguish "third minute of step 1 of Centrifuge" from "third minute of step
 | Pupil confidence filter | **≥ 0.6** | Standard Pupil Capture threshold for usable samples. |
 | Blink "tracking loss" cutoff | **≥ 2 s** | Excludes saccade-detector confusion / camera occlusion. |
 | Validity gate per window | `pupil_data_yield ≥ 0.6` **OR** `fixation_count ≥ 1` | Drops windows where neither the pupil nor the fixation source had usable data. |
-| Pupil baseline | Mean of first **60 s** of high-confidence pupil samples in the session | Required for `pupil_pcps_mean` and the z-scored pupil features. Computed once per session before predictions can begin. |
+| Pupil baseline | Mean over the **quietest 120 s** in the session (lowest blink + fixation count, scanned in 30 s steps) | Required for `pupil_pcps_mean`. Computed once per session before predictions can begin. Replaces the failed "first 120 s" approach which captured the busy 'Prep to start task' period. |
 
 ---
 
 ## 6. Data availability for the chosen features
 
-Strict-policy training set (no proxy, no fallback) using the 8 features above:
+Strict-policy training set (no proxy, no fallback) using the 7 features above:
 
 | Feature | Sessions with data |
 |---|---|
-| `pupil_pcps_mean`, `pupil_diam_slope` | **16 / 23** (offline export or live streaming) |
+| `pupil_pcps_mean` | **16 / 23** (offline export or live streaming) |
 | `blink_rate_per_min` | 19 / 23 |
 | `fixation_dur_mean_ms`, `fixation_dispersion_mean` | 22 / 23 |
 | `procedure_id`, `step_number`, `cumulative_session_time_s` | 23 / 23 |
@@ -145,22 +146,21 @@ All 8 features are extractable live. Source map for the deployed system:
 
 | Feature | Live source | Implementation status |
 |---|---|---|
-| `pupil_pcps_mean` | Pupil Capture ZMQ `pupil` topic + per-session baseline tracker | Pupil samples ✅ ingested today; baseline tracker is **not yet built** |
-| `pupil_diam_slope` | same as #1 | ✅ already computable from current pupil ingestion |
-| `blink_rate_per_min` | Pupil Capture ZMQ `blinks` topic (Online Blink Detector plugin) | Capture script subscribes ✅; backend ingestion endpoint is **not yet built** |
-| `fixation_dur_mean_ms` | Pupil Capture ZMQ `fixations` topic (Online Fixation Detector plugin) | Capture script does **not** subscribe yet; backend endpoint **not yet built** |
-| `fixation_dispersion_mean` | same as #4 | same as #4 |
-| `procedure_id` | RTAPS frontend `/session/start` POST | Endpoint **not yet built** |
-| `step_number` | RTAPS frontend `/session/step_change` POST | Endpoint **not yet built** |
-| `cumulative_session_time_s` | derived from session-start timestamp tracked per `stream_id` | Backend state **not yet built** |
+| `pupil_pcps_mean` | Pupil Capture ZMQ `pupil.` topic + per-session 120 s baseline tracker | Pupil ingestion ✅; baseline tracker ✅ built in `session_state.py` |
+| `blink_rate_per_min` | Pupil Capture ZMQ `blink` topic (Online Blink Detector plugin) | Bridge ✅ (`pupil_capture_bridge.py`); backend endpoint ✅ `/stream/blinks` |
+| `fixation_dur_mean_ms` | Pupil Capture ZMQ `fixation` topic (Online Fixation Detector plugin) | Bridge ✅; backend endpoint ✅ `/stream/fixations`. **Plugin must be ON in Pupil Capture.** |
+| `fixation_dispersion_mean` | same as `fixation_dur_mean_ms` | same as above |
+| `procedure_id` | RTAPS frontend `POST /session/start` | Endpoint ✅ |
+| `step_number` | RTAPS frontend `POST /session/step_change` | Endpoint ✅ |
+| `cumulative_session_time_s` | derived from session-start timestamp per `stream_id` | ✅ computed in `inference_loop.py` |
 
 Two prerequisites at the data-collection site:
 
 1. The **Online Blink Detector** and **Online Fixation Detector** plugins must
-   be enabled in Pupil Capture during recording (they're bundled but off by
-   default).
-2. The first 60 s of each session is a **warm-up** for baseline computation;
-   predictions should be suppressed until the baseline is ready.
+   be enabled in Pupil Capture during recording (they're bundled but **off by
+   default** — this is the most common reason fixations show 0 on the dashboard).
+2. The first **120 s** of each session is a warm-up for baseline computation;
+   predictions are suppressed until the baseline is ready.
 
 ---
 
@@ -192,11 +192,10 @@ materially improve performance.
    existing offline session through the live path and compares features +
    predictions to those produced by `04_extract_features_window.py`. This is a
    prerequisite for trusting any deployed prediction.
-3. **Baseline robustness is unvalidated.** Pupil baseline is currently
-   `mean(first 60 s, confidence ≥ 0.6)`. We have not tested whether using a
-   different window (30 s? 90 s?) or a different summary (median?) gives a
-   more stable baseline across the existing sessions. Worth a short ablation
-   once labels exist.
+3. **Baseline robustness is unvalidated.** Pupil baseline is now
+   `mean(first 120 s, confidence ≥ 0.6)` (extended from 60 s for stability).
+   We have not tested whether a different summary (median?) gives better
+   results. Worth a short ablation once real labels exist.
 
 ---
 
@@ -218,3 +217,5 @@ materially improve performance.
 | Date | Change |
 |---|---|
 | 2026-05-04 | Initial spec — 48 features → 8 features, no proxy / no gaze / no leaky task-progress columns. |
+| 2026-05-09 | Removed `pupil_diam_slope` → 7 features. Baseline extended 60 s → 120 s. Fixed fixation ZMQ topic (`fixations` → `fixation`) in all 3 capture scripts. |
+| 2026-05-09 | **X→Y strengthening pass**: (1) replaced "first 120 s" baseline with "quietest **120 s** in session" — fixes the busy-prep artifact that made pupil_pcps systematically negative for pressure_testing. (2) Added per-participant (`_zp`) and per-procedure (`_zproc`) z-scored variants of the 5 sensor features. (3) Switched to per-feature window lengths: pupil 10 s, fixation 30 s, blink 60 s — revealed strong cognitive blink suppression (centrifuge ρ = −0.60 with 120 s baseline). (4) Brought `pupil_diam_slope` back as a candidate feature. (5) Trained a sensors-only model (`v3_hgb_sensors_only.joblib`) with no `step_number`/`procedure_id` leakage; achieves κ=+0.02 — sensors now carry real signal but ceiling is low without an explicit calibration phase or window-level labels. |

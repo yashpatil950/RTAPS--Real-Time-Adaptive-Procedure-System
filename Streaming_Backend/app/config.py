@@ -39,7 +39,7 @@ class Settings:
     # ---- Feature/window contract (must match training pipeline) ----------
     window_len_s: float = _env_float("WINDOW_LEN_S", 10.0)
     stride_s: float = _env_float("STRIDE_S", 1.0)
-    baseline_duration_s: float = _env_float("BASELINE_DURATION_S", 60.0)
+    baseline_duration_s: float = _env_float("BASELINE_DURATION_S", 120.0)
     min_confidence: float = _env_float("MIN_CONFIDENCE", 0.6)
     blink_tracking_loss_s: float = _env_float("BLINK_TRACKING_LOSS_S", 2.0)
     expected_pupil_rate_hz_per_eye: float = _env_float("EXPECTED_PUPIL_RATE_HZ", 60.0)
@@ -48,7 +48,7 @@ class Settings:
     # ---- Model -----------------------------------------------------------
     model_path: Path = _env_path(
         "MODEL_PATH",
-        str(Path(__file__).resolve().parents[2] / "ML Algorithm" / "models" / "v1_hgb_weak.joblib"),
+        str(Path(__file__).resolve().parents[2] / "ML Algorithm" / "models" / "v4_rf_pnorm.joblib"),
     )
 
     # ---- Optional remote inference (forward features, get back prediction)

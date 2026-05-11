@@ -1,4 +1,12 @@
-"""Per-window blink features computed from blinks_clean.parquet."""
+"""Per-window blink features computed from blinks_clean.parquet.
+
+NOTE: as of v4, the canonical blink rate feature is `blink_rate_30s` —
+count of (non-tracking-loss) blinks in a 30-second sliding window. The
+old `blink_rate_per_min` (60-second window, extrapolated to /min) has
+been replaced because:
+  - 30 s gives faster reaction to workload changes
+  - the value is a direct count (no extrapolation), so easier to interpret
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -6,7 +14,7 @@ import pandas as pd
 
 BLINK_FEATURE_NAMES = [
     "blink_count",
-    "blink_rate_per_min",
+    "blink_rate_30s",                # was blink_rate_per_min
     "blink_dur_mean_s",
     "blink_dur_std_s",
     "blink_inter_interval_mean_s",
@@ -21,10 +29,14 @@ def extract(
     window_len_s: float,
     long_thresh_s: float,
 ) -> dict[str, float]:
-    """Compute blink features. Blinks flagged tracking_loss are excluded."""
+    """Compute blink features. Blinks flagged tracking_loss are excluded.
+
+    `blink_rate_30s` = count of non-tracking-loss blinks in the supplied
+    `window_len_s` window (which is 30 s for v4 per `lib/config.py`).
+    """
     out: dict[str, float] = {k: float("nan") for k in BLINK_FEATURE_NAMES}
     out["blink_count"] = 0.0
-    out["blink_rate_per_min"] = 0.0
+    out["blink_rate_30s"] = 0.0
     out["blink_long_count"] = 0.0
     if blinks_window is None or len(blinks_window) == 0:
         return out
@@ -37,7 +49,8 @@ def extract(
 
     n = len(bl)
     out["blink_count"] = float(n)
-    out["blink_rate_per_min"] = float(n) * (60.0 / window_len_s)
+    # Direct count over the window (no /min extrapolation).
+    out["blink_rate_30s"] = float(n)
     durs = bl["duration_s"].to_numpy(dtype=float)
     out["blink_dur_mean_s"] = float(np.mean(durs))
     if n >= 2:

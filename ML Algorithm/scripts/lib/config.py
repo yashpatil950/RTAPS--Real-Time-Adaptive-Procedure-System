@@ -29,9 +29,17 @@ PROCEDURE_SLUGS = tuple(PROCEDURE_ID_TO_SLUG.values())
 
 WINDOW_LEN_S = 10.0
 STRIDE_S = 1.0
+# Phase 3: per-feature window lengths.
+# Pupil samples are dense (~120 Hz across both eyes) so 10s gives stable estimates.
+# Fixations and blinks are sparse — 10s windows often have 0-2 events, making
+# rates unstable. Use longer rolling windows for those feature groups while
+# keeping predictions emitted every STRIDE_S seconds.
+WINDOW_LEN_S_PUPIL = 10.0
+WINDOW_LEN_S_FIXATION = 30.0
+WINDOW_LEN_S_BLINK = 30.0  # was 60s; reduced to 30s — feature renamed `blink_rate_30s`
 MIN_CONFIDENCE = 0.6
 MIN_DATA_YIELD = 0.6
-BASELINE_DURATION_S = 60.0
+BASELINE_DURATION_S = 120.0
 BLINK_LONG_THRESH_S = 0.5
 BLINK_TRACKING_LOSS_S = 2.0
 GAZE_GRID = (3, 3)

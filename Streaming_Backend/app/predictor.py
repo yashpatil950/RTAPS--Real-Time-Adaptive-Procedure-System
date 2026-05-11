@@ -1,7 +1,7 @@
 """Local model wrapper.
 
-The trained classifier is `ML Algorithm/models/v1_hgb_weak.joblib`. It was
-saved as a dict (see `06_train_classifier.py`) with explicit
+The trained classifier is `ML Algorithm/models/v2_hgb_vacp.joblib`. It was
+saved as a dict (see `07_train_vacp_model.py`) with explicit
 `feature_columns`, `categorical_columns`, and `label_order` so that the
 serving code can validate the contract at load time and refuse to start if
 the model and the live extractor have diverged.
@@ -34,7 +34,7 @@ class LocalPredictor:
         if not self.model_path.is_file():
             raise FileNotFoundError(
                 f"Model file not found at {self.model_path}. "
-                "Run `python 'ML Algorithm/scripts/06_train_classifier.py'` first, "
+                "Run `python 'ML Algorithm/scripts/07_train_vacp_model.py'` first, "
                 "or set MODEL_PATH to a different location."
             )
         loaded = joblib.load(self.model_path)

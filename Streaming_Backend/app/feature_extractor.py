@@ -1,11 +1,21 @@
-"""Live feature extractor — produces the 8 features the model expects.
+"""Live feature extractor — produces the 5 sensor-only features the v4 model expects.
+
+v4 contract (sensors-only, no step/procedure leakage):
+    pupil_pcps_mean        — over the last 10 s of pupil samples
+    pupil_diam_slope       — over the last 10 s of pupil samples
+    blink_rate_30s         — count of non-tracking-loss blinks in last 30 s
+    fixation_dur_mean_ms   — mean fixation duration in last 30 s (ms)
+    fixation_dispersion_mean — mean fixation dispersion in last 30 s
 
 Formulas mirror `ML Algorithm/scripts/lib/{pupil,blink,fixation}_features.py`
 exactly so that training-time and serving-time values are comparable. Anything
 that does not appear in `X_FEATURES.md` is intentionally left out.
 
-Inputs are plain numpy arrays so the same function can be called from the
-async inference loop, from a CLI, or from an offline replay test.
+`procedure_id` and `step_number` are NOT model features — including them lets
+the model fall back on a deterministic step-number lookup instead of learning
+from physiology. They're still passed in so we can stamp the prediction with
+the operator's current step (for downstream UI routing), but they don't enter
+the model input.
 """
 from __future__ import annotations
 
@@ -13,16 +23,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Order MUST match `FEATURE_COLS` in `ML Algorithm/scripts/06_train_classifier.py`.
+# Order MUST match `FEATURE_COLS` in `ML Algorithm/scripts/07c_train_rf_pnorm.py`.
+# Sensor features only — no step/procedure leakage.
 FEATURE_NAMES: tuple[str, ...] = (
     "pupil_pcps_mean",
     "pupil_diam_slope",
-    "blink_rate_per_min",
+    "blink_rate_30s",
     "fixation_dur_mean_ms",
     "fixation_dispersion_mean",
-    "procedure_id",
-    "step_number",
-    "cumulative_session_time_s",
 )
 
 
@@ -63,30 +71,29 @@ def extract_features(
     expected_pupil_rate_hz_per_eye: float,
     min_data_yield: float,
 ) -> tuple[dict[str, float | int | None], bool, dict[str, float]]:
-    """Compute the 8 model features over the supplied window slice.
+    """Compute the 5 v4 sensor features over the supplied window slices.
 
     Args:
         pupil_t / pupil_eye / pupil_diam_mm: aligned arrays of confidence-
             filtered pupil samples whose timestamps fall inside the current
-            window.
+            10-second pupil window.
         blink_durations_s: durations of non-tracking-loss blinks whose start
-            timestamps fall inside the current window.
+            timestamps fall inside the current 30-second blink window.
         fix_durations_s / fix_dispersion: aligned arrays of fixations whose
-            start timestamps fall inside the current window.
+            start timestamps fall inside the current 30-second fixation window.
         baseline: per-session pupil baseline (or None if not yet ready).
         procedure_id / step_number / cumulative_session_time_s: live task
-            context from the RTAPS UI.
+            context — passed through for prediction stamping but NOT used as
+            model inputs in v4.
 
     Returns:
         (features, is_valid, qa) where:
           features  - dict keyed by FEATURE_NAMES (NaN where the source had
-                      no data; the trained HGB classifier handles NaN
-                      natively for the 5 numeric inputs);
+                      no data — Random Forest predictor handles via the
+                      pipeline's SimpleImputer);
           is_valid  - True iff `pupil_data_yield >= min_data_yield` OR at
-                      least one fixation fell in the window. Mirrors the
-                      validity gate in `04_extract_features_window.py`;
-          qa        - dict of internal QA values (data yield, sample counts)
-                      kept for /session/state and logging.
+                      least one fixation fell in the window;
+          qa        - dict of internal QA values (data yield, sample counts).
     """
     n_pupil = int(len(pupil_t))
     expected = max(1.0, expected_pupil_rate_hz_per_eye * 2.0 * window_len_s)
@@ -113,8 +120,9 @@ def extract_features(
     # ---- pupil_diam_slope ----------------------------------------------- #
     pupil_slope = _safe_slope(pupil_t, pupil_diam_mm) if n_pupil >= 3 else float("nan")
 
-    # ---- blink_rate_per_min --------------------------------------------- #
-    blink_rate = float(len(blink_durations_s)) * (60.0 / window_len_s)
+    # ---- blink_rate_30s --------------------------------------------------- #
+    # Direct count over the 30-second blink window (no /min extrapolation).
+    blink_rate_30s = float(len(blink_durations_s))
 
     # ---- fixation_dur_mean_ms ------------------------------------------- #
     n_fix = int(len(fix_durations_s))
@@ -130,12 +138,9 @@ def extract_features(
     features: dict[str, float | int | None] = {
         "pupil_pcps_mean": pcps_mean,
         "pupil_diam_slope": pupil_slope,
-        "blink_rate_per_min": blink_rate,
+        "blink_rate_30s": blink_rate_30s,
         "fixation_dur_mean_ms": fix_dur_mean_ms,
         "fixation_dispersion_mean": fix_disp_mean,
-        "procedure_id": int(procedure_id),
-        "step_number": int(step_number),
-        "cumulative_session_time_s": float(cumulative_session_time_s),
     }
 
     is_valid = (pupil_data_yield >= min_data_yield) or (n_fix >= 1)
@@ -145,5 +150,9 @@ def extract_features(
         "pupil_data_yield": pupil_data_yield,
         "blink_count": float(len(blink_durations_s)),
         "fixation_count": float(n_fix),
+        # Stamped passthrough — not used by the model, but kept for the UI.
+        "procedure_id": int(procedure_id),
+        "step_number": int(step_number),
+        "cumulative_session_time_s": float(cumulative_session_time_s),
     }
     return features, is_valid, qa

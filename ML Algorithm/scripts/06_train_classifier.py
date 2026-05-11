@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Stage 6: train the workload classifier on the 8 features defined in
+"""Stage 6: train the workload classifier on the 7 features defined in
 `X_FEATURES.md`.
 
 Single source of truth for features at training time:
 
     pupil_pcps_mean
-    pupil_diam_slope
     blink_rate_per_min
     fixation_dur_mean_ms
     fixation_dispersion_mean
@@ -13,7 +12,7 @@ Single source of truth for features at training time:
     step_number
     cumulative_session_time_s
 
-The same 8 columns must be produced live by the streaming backend at serving
+The same 7 columns must be produced live by the streaming backend at serving
 time (see `streaming_backend/`). Anything else is intentionally excluded — see
 `X_FEATURES.md` §4 for the rationale.
 
@@ -69,7 +68,6 @@ from lib.config import ML_ROOT, PROCEDURE_ID_TO_SLUG, PROCESSED_ROOT  # noqa: E4
 
 FEATURE_COLS = [
     "pupil_pcps_mean",
-    "pupil_diam_slope",
     "blink_rate_per_min",
     "fixation_dur_mean_ms",
     "fixation_dispersion_mean",
@@ -195,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     df_all = _load_all_windows(args.processed_root)
     print(f"  total: {len(df_all)} rows  ({df_all['session_uid'].nunique()} sessions)")
 
-    print("\nFiltering and selecting the 8 features from X_FEATURES.md...")
+    print("\nFiltering and selecting the 7 features from X_FEATURES.md...")
     X, y, groups, keys = _prepare(df_all)
     n_groups = pd.Series(groups).nunique()
     n_splits = max(2, min(args.n_splits, n_groups))

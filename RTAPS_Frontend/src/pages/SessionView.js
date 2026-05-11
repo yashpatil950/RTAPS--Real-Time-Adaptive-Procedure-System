@@ -3,7 +3,7 @@ import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, CheckCircle, Expand, Clock, Lightbulb } from 'lucide-react';
 import { getProcedureByTrain } from '../data/procedures';
 import { appendCompletedSession } from '../data/analyticsStorage';
-import { getStepFeedback, getWorkloadLevel } from '../data/stepFeedback';
+import { getStepFeedback } from '../data/stepFeedback';
 import {
   ensureStoredStreamId,
   getStoredStreamId,
@@ -11,7 +11,14 @@ import {
   streamingSessionStart,
   streamingStepChange,
   streamingSessionEnd,
+  subscribePredictions,
 } from '../services/streamingApi';
+
+// Workload level ordering — used to compute "highest level reached so far".
+// When the operator's predicted workload escalates (e.g. medium → high), we
+// keep showing the previous medium feedback alongside the new high feedback,
+// so they retain context.
+const LEVEL_RANK = { low: 0, medium: 1, high: 2 };
 
 const SessionView = () => {
   const { procedureId } = useParams();
@@ -53,9 +60,15 @@ const SessionView = () => {
     } catch (_) { return true; }
   });
   
-  // Generate random workload probabilities for each step (for testing)
-  // In production, this would come from the advanced model
-  const [stepWorkloadProbabilities, setStepWorkloadProbabilities] = useState({});
+  // Per-step workload state from the streaming ML backend.
+  // Format: { [stepId]: { current, highest, proba, decisionTime, rawLabel } }
+  // - current: latest smoothed label from the SSE stream
+  // - highest: the highest level the step has ever reached (sticky — does not
+  //            decrease even if `current` drops, so previous instructions stay
+  //            visible after escalation)
+  // - proba: per-class probabilities from the model
+  const [stepWorkloadStates, setStepWorkloadStates] = useState({});
+  const [latestPrediction, setLatestPrediction] = useState(null);
   const [streamingHookReady, setStreamingHookReady] = useState(false);
 
   useEffect(() => {
@@ -119,7 +132,7 @@ const SessionView = () => {
       console.warn('[RTAPS streaming step_change]', err.message || err);
     });
     return undefined;
-  }, [procedure, completedSteps, streamingHookReady]);
+  }, [procedure, completedSteps, streamingHookReady]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const streamingBanner =
     typeof window !== 'undefined' && isStreamingIntegrationEnabled() ? getStoredStreamId().trim() : '';
@@ -135,17 +148,49 @@ const SessionView = () => {
     }
   });
   
-  // Initialize random workload probabilities for each step
+  // Subscribe to live predictions from the streaming ML backend.
+  // Each prediction carries (step_number, workload_label) — we map it back to
+  // the step on this page and update state. `highest` is sticky so previous
+  // medium instructions remain visible when the level later escalates to high.
   useEffect(() => {
-    if (procedure && procedure.steps) {
-      const probabilities = {};
-      procedure.steps.forEach(step => {
-        // Generate random probability between 0 and 1 for testing
-        probabilities[step.id] = Math.random();
-      });
-      setStepWorkloadProbabilities(probabilities);
-    }
-  }, [procedure]);
+    if (!procedure || typeof window === 'undefined') return undefined;
+    const enabled = isStreamingIntegrationEnabled();
+    const sid = ensureStoredStreamId(procedure.id, trainNumber).trim();
+    if (!enabled || !sid || !streamingHookReady) return undefined;
+
+    const cleanup = subscribePredictions(
+      sid,
+      (data) => {
+        if (!data || typeof data !== 'object') return;
+        const label = data.workload_label;
+        const stepNum = data.step_number;
+        if (!label || stepNum == null) return;
+        const step = procedure.steps.find((s) => s.stepNumber === stepNum);
+        if (!step) return;
+
+        setLatestPrediction(data);
+        setStepWorkloadStates((prev) => {
+          const cur = prev[step.id] || { current: 'low', highest: 'low' };
+          const curRank = LEVEL_RANK[cur.highest] ?? 0;
+          const newRank = LEVEL_RANK[label] ?? 0;
+          const highest = newRank > curRank ? label : cur.highest;
+          return {
+            ...prev,
+            [step.id]: {
+              current: label,
+              highest,
+              proba: data.workload_proba || null,
+              decisionTime: data.decision_time || null,
+              rawLabel: data.raw_workload_label || null,
+            },
+          };
+        });
+      },
+      (err) => console.warn('[RTAPS streaming SSE]', err && (err.message || err))
+    );
+
+    return cleanup;
+  }, [procedure, trainNumber, streamingHookReady]);
 
   // Initialize step start times - only start the first step
   useEffect(() => {
@@ -253,6 +298,23 @@ const SessionView = () => {
     }
   };
 
+  // Resolve the workload level to display for a given step.
+  //   1. If we've ever received a streaming prediction for this step, use the
+  //      *highest* level it ever reached (sticky — preserves accumulated
+  //      instructions after escalation, then de-escalation).
+  //   2. Otherwise (warm-up period, streaming disabled, or no model data),
+  //      fall back to a time-threshold escalation:  past threshold → medium,
+  //      past 1.5× threshold → high. This keeps the UI useful even when ML
+  //      isn't connected.
+  const getStepDisplayLevel = (step) => {
+    const wl = stepWorkloadStates[step.id];
+    if (wl && wl.highest) return wl.highest;
+    const t = stepTimes[step.id] || 0;
+    if (t >= step.timeThreshold * 1.5) return 'high';
+    if (t >= step.timeThreshold) return 'medium';
+    return 'low';
+  };
+
   const formatTime = (seconds) => {
     const hours = Math.floor(seconds / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
@@ -310,11 +372,23 @@ const SessionView = () => {
       <div className="tablet-card text-center">
         {streamingBanner ? (
           <div className="mb-4 rounded-lg border border-sky-200 bg-sky-50 px-4 py-2 text-sm text-sky-900 flex flex-wrap items-center justify-between gap-2">
-            <span className="font-medium">Streaming ML: active</span>
+            <span className="font-medium">
+              Streaming ML: {latestPrediction ? 'live' : 'active'}
+              {latestPrediction && (
+                <span className="ml-2 px-2 py-0.5 rounded bg-white text-xs font-semibold uppercase border border-sky-300">
+                  {latestPrediction.workload_label}
+                </span>
+              )}
+            </span>
             <span className="font-mono text-xs text-sky-800">
               stream_id <span className="font-semibold">{streamingBanner}</span>
               {' · '}
               backend sync {streamingHookReady ? 'ready' : 'connecting…'}
+              {latestPrediction && (
+                <>
+                  {' · '}step {latestPrediction.step_number}
+                </>
+              )}
             </span>
           </div>
         ) : null}
@@ -421,27 +495,37 @@ const SessionView = () => {
                   </div>
                   
                   <div className="text-right">
-                    {/* Clean interface - no technical details shown to user */}
+                    {/* Clean interface - no technical details shown to operator.
+                        Dev mode surfaces the real ML workload state. */}
                     {devMode && (
                       <div className="text-xs text-gray-500 text-right">
                         {!useWorkloadFeedback && <div>Target: {step.timeThreshold}s</div>}
-                        {useWorkloadFeedback && (
-                          <div>
-                            Workload: {(stepWorkloadProbabilities[step.id] * 100).toFixed(1)}%
-                            <button
-                              onClick={() => {
-                                // Generate new random workload probability
-                                setStepWorkloadProbabilities(prev => ({
-                                  ...prev,
-                                  [step.id]: Math.random()
-                                }));
-                              }}
-                              className="ml-2 px-2 py-1 bg-gray-100 hover:bg-gray-200 rounded border text-gray-700"
-                            >
-                              New Random
-                            </button>
-                          </div>
-                        )}
+                        {useWorkloadFeedback && (() => {
+                          const wl = stepWorkloadStates[step.id];
+                          if (!wl) {
+                            return (
+                              <div>
+                                Workload: <span className="font-mono">— (waiting for stream)</span>
+                              </div>
+                            );
+                          }
+                          const proba = wl.proba || {};
+                          return (
+                            <div>
+                              <div>
+                                Current: <span className="font-semibold uppercase">{wl.current}</span>
+                                {' · '}
+                                Highest: <span className="font-semibold uppercase">{wl.highest}</span>
+                                {wl.rawLabel && wl.rawLabel !== wl.current ? (
+                                  <span className="ml-1 text-gray-400">(raw: {wl.rawLabel})</span>
+                                ) : null}
+                              </div>
+                              <div className="font-mono">
+                                low {((proba.low || 0) * 100).toFixed(0)}% · med {((proba.medium || 0) * 100).toFixed(0)}% · high {((proba.high || 0) * 100).toFixed(0)}%
+                              </div>
+                            </div>
+                          );
+                        })()}
                         <div className="mt-1 flex items-center justify-end space-x-2">
                           <span className="text-gray-500">{isActiveStep ? `Time on this step: ${formatTime(timeSpent)}` : ''}</span>
                           {isActiveStep && !useWorkloadFeedback && (
@@ -484,87 +568,66 @@ const SessionView = () => {
                   </div>
                 )}
 
-                {/* NEW: Workload-based feedback system with developer-controlled detail */}
+                {/*
+                 * Workload-based instructions, with CUMULATIVE display:
+                 *  - At medium  → show medium key points
+                 *  - At high    → show medium key points  AND  detailed why/what/how
+                 *  - Once a higher level is reached for a step, the lower-level
+                 *    block stays visible (uses `highest`, not `current`).
+                 *
+                 * Replaces the old image-on-timeout sub-step system.
+                 */}
                 {useWorkloadFeedback && (() => {
-                  const workloadProb = stepWorkloadProbabilities[step.id] || 0;
-                  const workloadLevel = getWorkloadLevel(workloadProb);
-
                   // Only show guidance for the active step
-                  if (!isActiveStep) {
-                    return null;
+                  if (!isActiveStep) return null;
+
+                  // The display level is sticky: it's the highest workload the
+                  // model has predicted for this step so far. In dev mode the
+                  // explanation level toggle overrides the model.
+                  let displayLevel = getStepDisplayLevel(step);
+                  if (devMode && explanationLevel) {
+                    displayLevel = explanationLevel === 'low' ? 'medium' : explanationLevel;
                   }
+                  if (displayLevel === 'low') return null;
 
-                  let feedback = null;
-                  let effectiveDetailLevel = null;
+                  const mediumFb = getStepFeedback(procedure.id, step.stepNumber, 'medium');
+                  const highFb =
+                    displayLevel === 'high'
+                      ? getStepFeedback(procedure.id, step.stepNumber, 'high')
+                      : null;
+                  if (!mediumFb && !highFb) return null;
 
-                  if (devMode) {
-                    // In dev mode, always show guidance for active step.
-                    // Explanation level controls amount/detail, not visibility.
-                    effectiveDetailLevel = explanationLevel === 'high' ? 'high' : 'medium';
-                    feedback = getStepFeedback(procedure.id, step.stepNumber, effectiveDetailLevel);
-
-                    // Fallback: if high detail not defined, use medium when available
-                    if (!feedback && effectiveDetailLevel === 'high') {
-                      effectiveDetailLevel = 'medium';
-                      feedback = getStepFeedback(procedure.id, step.stepNumber, 'medium');
-                    }
-                  } else {
-                    // For end users, keep workload-driven behavior
-                    if (workloadLevel === 'low') {
-                      return null;
-                    }
-                    effectiveDetailLevel = workloadLevel === 'high' ? 'high' : 'medium';
-                    feedback = getStepFeedback(procedure.id, step.stepNumber, effectiveDetailLevel);
-                  }
-
-                  if (!feedback) {
-                    return null;
-                  }
-
-                  const isHighDetail = feedback.type === 'high';
-                  const detailLabel = devMode
-                    ? (explanationLevel === 'low'
-                      ? 'Low'
-                      : explanationLevel === 'high'
-                        ? 'High'
-                        : 'Medium')
-                    : (isHighDetail ? 'High' : 'Medium');
-
+                  const wl = stepWorkloadStates[step.id];
                   return (
-                    <div className="mt-4">
-                      <div
-                        className={`border rounded-lg p-3 mb-3 ${
-                          isHighDetail
-                            ? 'bg-orange-50 border-orange-200'
-                            : 'bg-yellow-50 border-yellow-200'
-                        }`}
-                      >
-                        <div
-                          className={`flex items-center justify-between font-medium mb-2 ${
-                            isHighDetail ? 'text-orange-800' : 'text-yellow-800'
-                          }`}
-                        >
-                          <div className="flex items-center">
-                            <Lightbulb className="w-4 h-4 mr-2" />
-                            <span>
-                              {isHighDetail
-                                ? 'Detailed Explanation Available'
-                                : 'Additional Guidance Available'}
+                    <div className="mt-4 space-y-3">
+                      {/* Header strip — surfaces ML status when devMode */}
+                      <div className="flex items-center justify-between text-xs text-gray-600">
+                        <div className="flex items-center">
+                          <Lightbulb className="w-4 h-4 mr-2 text-yellow-600" />
+                          <span className="font-medium">
+                            Adaptive guidance:&nbsp;
+                            {displayLevel === 'high'
+                              ? 'Detailed (Medium + High)'
+                              : 'Additional (Medium)'}
+                          </span>
+                          {devMode && wl && (
+                            <span className="ml-3 text-gray-500">
+                              ML current: <span className="font-mono uppercase">{wl.current}</span>
+                              {wl.highest !== wl.current && (
+                                <>
+                                  {' · '}highest: <span className="font-mono uppercase">{wl.highest}</span>
+                                </>
+                              )}
                             </span>
-                            {devMode && (
-                              <span className="ml-2 text-xs opacity-75">
-                                (Workload: {(workloadProb * 100).toFixed(1)}%)
-                              </span>
-                            )}
-                          </div>
-                          <div className="ml-4 text-xs text-gray-600">
-                            Detail: {detailLabel}
-                          </div>
+                          )}
+                          {devMode && !wl && (
+                            <span className="ml-3 text-gray-400">(ML stream warming up — using time-threshold fallback)</span>
+                          )}
                         </div>
 
                         {devMode && (
-                          <div className="mb-3 flex items-center justify-end text-xs text-gray-600">
-                            <span className="mr-2">Explanation detail</span>
+                          <div className="flex items-center text-xs text-gray-600">
+                            <span className="mr-2">Override:</span>
                             <div className="inline-flex rounded-md border border-gray-300 bg-white overflow-hidden">
                               {['low', 'medium', 'high'].map((level) => (
                                 <button
@@ -588,27 +651,36 @@ const SessionView = () => {
                             </div>
                           </div>
                         )}
+                      </div>
 
-                        {feedback.type === 'medium' && (
-                          <div className="space-y-1">
-                            <p className="text-sm font-semibold text-yellow-900 mb-2">Key Points:</p>
-                            <ul className="list-disc list-inside space-y-1 text-sm text-yellow-800">
-                              {(devMode && explanationLevel === 'low'
-                                ? feedback.content.slice(0, 1)
-                                : feedback.content
-                              ).map((point, idx) => (
-                                <li key={idx}>{point}</li>
-                              ))}
-                            </ul>
+                      {/* Medium block — shown for medium AND high (cumulative) */}
+                      {mediumFb && (
+                        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                          <div className="flex items-center text-yellow-800 font-medium mb-2">
+                            <Lightbulb className="w-4 h-4 mr-2" />
+                            <span>Additional Guidance</span>
                           </div>
-                        )}
-                        
-                        {feedback.type === 'high' && feedback.content && (
+                          <p className="text-sm font-semibold text-yellow-900 mb-2">Key Points:</p>
+                          <ul className="list-disc list-inside space-y-1 text-sm text-yellow-800">
+                            {mediumFb.content.map((point, idx) => (
+                              <li key={idx}>{point}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {/* High block — only when escalated, shown ON TOP of medium */}
+                      {highFb && highFb.content && (
+                        <div className="bg-orange-50 border border-orange-200 rounded-lg p-3">
+                          <div className="flex items-center text-orange-800 font-medium mb-2">
+                            <Lightbulb className="w-4 h-4 mr-2" />
+                            <span>Detailed Explanation</span>
+                          </div>
                           <div className="space-y-3">
                             <div>
                               <p className="text-sm font-semibold text-orange-900 mb-1">Why:</p>
                               <ul className="list-disc list-inside space-y-1 text-sm text-orange-800">
-                                {feedback.content.why.map((point, idx) => (
+                                {highFb.content.why.map((point, idx) => (
                                   <li key={idx}>{point}</li>
                                 ))}
                               </ul>
@@ -616,7 +688,7 @@ const SessionView = () => {
                             <div>
                               <p className="text-sm font-semibold text-orange-900 mb-1">What:</p>
                               <ul className="list-disc list-inside space-y-1 text-sm text-orange-800">
-                                {feedback.content.what.map((point, idx) => (
+                                {highFb.content.what.map((point, idx) => (
                                   <li key={idx}>{point}</li>
                                 ))}
                               </ul>
@@ -624,65 +696,17 @@ const SessionView = () => {
                             <div>
                               <p className="text-sm font-semibold text-orange-900 mb-1">How:</p>
                               <ul className="list-disc list-inside space-y-1 text-sm text-orange-800">
-                                {feedback.content.how.map((point, idx) => (
+                                {highFb.content.how.map((point, idx) => (
                                   <li key={idx}>{point}</li>
                                 ))}
                               </ul>
                             </div>
                           </div>
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })()}
-
-                {/* OLD: Time-threshold based sub-steps (legacy system) */}
-                {!useWorkloadFeedback && timeSpent > step.timeThreshold && step.subSteps.length > 0 && (
-                  <div className="mt-4">
-                    <div className="bg-purple-50 border border-purple-200 rounded-lg p-3 mb-3">
-                      <div className="flex items-center text-purple-800 font-medium">
-                        <Expand className="w-4 h-4 mr-2" />
-                        <span>Additional guidance is now available to help you complete this step</span>
-                      </div>
-                    </div>
-                    
-                    <div className="ml-8 space-y-3">
-                      {step.subSteps.map((subStep, subIndex) => (
-                        <div key={subStep.id} className="bg-gray-50 rounded-lg p-3 border-l-4 border-purple-200">
-                          <div className="flex items-start justify-between">
-                            <div className="flex items-center space-x-2">
-                              <div className="w-6 h-6 bg-purple-100 rounded-full flex items-center justify-center">
-                                <span className="text-purple-600 text-xs font-semibold">
-                                  {index + 1}.{subIndex + 1}
-                                </span>
-                              </div>
-                              <div>
-                                <h5 className="font-medium text-gray-900">{subStep.title}</h5>
-                                <p className="text-gray-600 text-sm">{subStep.description}</p>
-                              </div>
-                            </div>
-                          </div>
-                          
-                          {subStep.instructions && subStep.instructions.trim() !== '' && (
-                            <div className="mt-2 text-sm text-gray-600">
-                              <strong>Instructions:</strong> {subStep.instructions}
-                            </div>
-                          )}
-
-                          {subStep.imageUrl && (
-                            <div className="mt-3">
-                              <img
-                                src={subStep.imageUrl}
-                                alt={subStep.title}
-                                className="w-full max-w-md rounded border border-gray-200"
-                              />
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </div>
             );
           });
@@ -711,13 +735,12 @@ const SessionView = () => {
             )}
           </div>
           <h3 className="text-lg font-semibold text-gray-900">
-            {useWorkloadFeedback 
-              ? Object.values(stepWorkloadProbabilities).filter((prob, idx) => {
-                  const step = procedure.steps[idx];
-                  return step && getWorkloadLevel(prob) !== 'low';
+            {useWorkloadFeedback
+              ? procedure.steps.filter((s) => {
+                  const lvl = getStepDisplayLevel(s);
+                  return lvl !== 'low';
                 }).length
-              : expandedSteps.size
-            }
+              : expandedSteps.size}
           </h3>
           <p className="text-gray-600">
             {useWorkloadFeedback ? 'Steps with Feedback' : 'Steps with Sub-tasks'}

@@ -1,0 +1,8 @@
+feature,importance_mean,importance_std
+step_number,0.6330017014297092,0.0024495414846991467
+procedure_id,0.284564713771408,0.0023229342289183283
+cumulative_session_time_s,0.002798673796725093,0.00033111039439494766
+pupil_pcps_mean,0.0,0.0
+blink_rate_per_min,0.0,0.0
+fixation_dur_mean_ms,0.0,0.0
+fixation_dispersion_mean,0.0,0.0

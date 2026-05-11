@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { Play, Eye, Clock, CheckCircle, ChevronDown, ChevronUp, Train, Radio } from 'lucide-react';
-import { getAllProcedures, getProceduresByTrain } from '../data/procedures';
+import { getProceduresByTrain } from '../data/procedures';
 
 const Dashboard = () => {
   const navigate = useNavigate();

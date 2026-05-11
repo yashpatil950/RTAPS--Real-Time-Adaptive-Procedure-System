@@ -1,0 +1,4 @@
+,pred_low,pred_medium,pred_high
+true_low,24,20,47
+true_medium,14,17,31
+true_high,13,16,52

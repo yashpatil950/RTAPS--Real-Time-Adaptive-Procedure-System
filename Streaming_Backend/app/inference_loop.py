@@ -1,9 +1,10 @@
 """Asynchronous inference tick.
 
-Once per `STRIDE_S` seconds we walk every active session, compute the 8
+Once per `STRIDE_S` seconds we walk every active session, compute the 7
 features over its current window, run the prediction (locally or remote),
-publish the result on the per-session SSE channel, and optionally POST it
-to the configured frontend webhook.
+pass the raw label through a WorkloadSmoother (30-second stability gate +
+direction guard), publish the stable result on the per-session SSE channel,
+and optionally POST it to the configured frontend webhook.
 
 Runs as a single background asyncio task started from the FastAPI lifespan
 (see `main.py`). One loop, no per-session timers — that keeps the cost
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Optional
 
@@ -21,6 +23,25 @@ from app.fargate_client import predict_remote, push_prediction_webhook
 from app.feature_extractor import extract_features
 from app.predictor import LocalPredictor
 from app.session_state import SessionRegistry, SessionState
+from app.workload_smoother import WorkloadSmoother
+
+
+def _json_safe(d: dict) -> dict:
+    """Convert NaN / inf floats to None so the dict is valid JSON.
+
+    Stdlib `json.dumps` with `allow_nan=False` (FastAPI's default) and
+    `pydantic v2` both reject NaN. The model produces NaN for sensor
+    features when their source had no data in the window (e.g. zero blinks
+    in 60 s) — the trained HGB classifier handles NaN natively, but the
+    response payload must be JSON-compliant.
+    """
+    out: dict = {}
+    for k, v in d.items():
+        if isinstance(v, float) and not math.isfinite(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
 
 log = logging.getLogger(__name__)
 
@@ -30,12 +51,25 @@ class InferenceLoop:
         self,
         registry: SessionRegistry,
         predictor: Optional[LocalPredictor],
+        smoother_stability_s: int = 30,
     ):
         self._registry = registry
         self._predictor = predictor
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._sse_queues: dict[str, list[asyncio.Queue]] = {}
+        # One WorkloadSmoother per active stream; created lazily.
+        self._smoothers: dict[str, WorkloadSmoother] = {}
+        self._smoother_stability_s = smoother_stability_s
+
+    def _get_smoother(self, stream_id: str) -> WorkloadSmoother:
+        if stream_id not in self._smoothers:
+            self._smoothers[stream_id] = WorkloadSmoother(self._smoother_stability_s)
+        return self._smoothers[stream_id]
+
+    def drop_smoother(self, stream_id: str) -> None:
+        """Call when a session ends so the smoother's memory is freed."""
+        self._smoothers.pop(stream_id, None)
 
     # ---- lifecycle ------------------------------------------------------ #
 
@@ -102,14 +136,25 @@ class InferenceLoop:
     async def _tick_once(self) -> None:
         sessions = self._registry.all()
         if not sessions:
-            await self._registry.evict_idle()
+            evicted = await self._registry.evict_idle()
+            if evicted:
+                # Drop smoothers for sessions that were evicted
+                active_ids = {st.stream_id for st in self._registry.all()}
+                for sid in list(self._smoothers):
+                    if sid not in active_ids:
+                        self._smoothers.pop(sid, None)
             return
         for st in sessions:
             try:
                 await self._maybe_predict(st)
             except Exception as exc:
                 log.exception("Predicting for stream %s failed: %s", st.stream_id, exc)
-        await self._registry.evict_idle()
+        evicted = await self._registry.evict_idle()
+        if evicted:
+            active_ids = {st.stream_id for st in self._registry.all()}
+            for sid in list(self._smoothers):
+                if sid not in active_ids:
+                    self._smoothers.pop(sid, None)
 
     async def _maybe_predict(self, st: SessionState) -> None:
         async with st.lock:
@@ -126,6 +171,10 @@ class InferenceLoop:
             cumulative = decision_t - st.session_started_at
             arrays = st.window_arrays()
             baseline = st.baseline.baseline()
+            step_changed = st.step_changed_at == decision_t  # True on the first tick after a step change
+            proc_id = int(st.procedure_id)
+            step_num = int(st.step_number)
+            stream_id = st.stream_id
 
             features, is_valid, qa = extract_features(
                 pupil_t=arrays["pupil_t"],
@@ -135,31 +184,42 @@ class InferenceLoop:
                 fix_durations_s=arrays["fix_durations_s"],
                 fix_dispersion=arrays["fix_dispersion"],
                 baseline=baseline,
-                procedure_id=st.procedure_id,
-                step_number=st.step_number,
+                procedure_id=proc_id,
+                step_number=step_num,
                 cumulative_session_time_s=cumulative,
                 window_len_s=settings.window_len_s,
                 expected_pupil_rate_hz_per_eye=settings.expected_pupil_rate_hz_per_eye,
                 min_data_yield=settings.min_data_yield,
             )
-            proc_id = int(st.procedure_id)
-            step_num = int(st.step_number)
-            stream_id = st.stream_id
 
         # Do not hold session lock during model / HTTP inference — blocks pupil & fixation ingress.
         try:
             if settings.fargate_inference_url:
-                label, proba = await predict_remote(stream_id, decision_t, features)
+                raw_label, proba = await predict_remote(stream_id, decision_t, features)
                 source = "remote"
             else:
                 if self._predictor is None:
                     log.warning("No local predictor and no FARGATE_INFERENCE_URL set; skipping.")
                     return
-                label, proba = self._predictor.predict(features)
+                raw_label, proba = self._predictor.predict(features)
                 source = "local"
         except Exception:
             log.exception("Inference failed for stream %s", stream_id)
             return
+
+        # Apply workload smoother: 30-second stability gate + direction guard.
+        smoother = self._get_smoother(stream_id)
+        if step_changed:
+            # Clear the pending candidate so the new step's predictions
+            # accumulate fresh, but keep the currently shown level.
+            smoother.reset_candidate()
+        stable_label = smoother.update(raw_label)
+
+        # Sanitize NaN/inf values in the response payload (the predictor has
+        # already consumed `features` directly, so NaNs went through HGB
+        # natively; here we convert them to None for JSON serialization).
+        feature_values_safe = _json_safe(features)
+        qa_safe = _json_safe(qa)
 
         prediction: dict = {
             "stream_id": stream_id,
@@ -167,13 +227,17 @@ class InferenceLoop:
             "procedure_id": proc_id,
             "step_number": step_num,
             "cumulative_session_time_s": float(cumulative),
-            "workload_label": label,
+            # raw_label  = direct model output (changes every second)
+            # workload_label = smoothed level shown to the operator
+            "raw_workload_label": raw_label,
+            "workload_label": stable_label,
             "workload_proba": proba,
-            "feature_values": features,
+            "smoother_state": smoother.state_dict(),
+            "feature_values": feature_values_safe,
             "inference_source": source,
             "is_valid_window": bool(is_valid),
             "notes": None if is_valid else "low data yield in window — prediction may be unreliable",
-            "qa": qa,
+            "qa": qa_safe,
         }
 
         async with st.lock:

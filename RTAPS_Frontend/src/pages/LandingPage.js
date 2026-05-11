@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
 import apiService from '../services/api';
 
 const LandingPage = () => {
@@ -10,7 +9,6 @@ const LandingPage = () => {
   const [usernameError, setUsernameError] = useState('');
   const [isCheckingAvailability, setIsCheckingAvailability] = useState(false);
   const [availabilityStatus, setAvailabilityStatus] = useState(''); // 'available', 'taken', 'checking', 'found'
-  const navigate = useNavigate();
 
   // Check if username is available (for new users)
   const isUsernameAvailable = async (username) => {

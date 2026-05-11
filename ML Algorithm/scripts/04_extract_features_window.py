@@ -41,6 +41,9 @@ from lib.config import (  # noqa: E402
     PROCEDURE_SLUG_TO_ID,
     STRIDE_S,
     WINDOW_LEN_S,
+    WINDOW_LEN_S_BLINK,
+    WINDOW_LEN_S_FIXATION,
+    WINDOW_LEN_S_PUPIL,
 )
 from lib.sync import ClockAnchor  # noqa: E402
 
@@ -156,9 +159,11 @@ def _featurize_session(sd: SessionData) -> pd.DataFrame:
     pupil_start = sd.anchor.synced_at_pupil_start
     pupil_end = sd.anchor.synced_end
 
-    # decision grid: every STRIDE seconds inside the procedure, plus one full
-    # window of warmup at the start.
-    t_first = max(session_start + WINDOW_LEN_S, pupil_start + WINDOW_LEN_S)
+    # decision grid: every STRIDE seconds inside the procedure. Warmup must
+    # cover the LONGEST per-feature window so blink_rate (60 s) and fixation
+    # features (30 s) have full history before the first prediction.
+    longest_window_s = max(WINDOW_LEN_S_PUPIL, WINDOW_LEN_S_FIXATION, WINDOW_LEN_S_BLINK)
+    t_first = max(session_start + WINDOW_LEN_S, pupil_start + longest_window_s)
     t_last = min(session_end, pupil_end)
     if t_last <= t_first:
         return pd.DataFrame()
@@ -202,8 +207,16 @@ def _featurize_session(sd: SessionData) -> pd.DataFrame:
 
     rows: list[dict] = []
     for t in t_grid:
+        # Primary window (used for the validity gate, gaze features, and
+        # window_start/end metadata). Per-feature group slices below override
+        # this for pupil/fixation/blink.
         w_lo = t - WINDOW_LEN_S
         w_hi = t
+        # Phase 3: per-feature window slices. Predictions still emitted every
+        # STRIDE_S seconds; the slice that feeds each feature group changes.
+        wp_lo, wp_hi = t - WINDOW_LEN_S_PUPIL, t       # pupil = 10 s
+        wf_lo, wf_hi = t - WINDOW_LEN_S_FIXATION, t    # fixation = 30 s
+        wb_lo, wb_hi = t - WINDOW_LEN_S_BLINK, t       # blink = 60 s
 
         # Step lookup: latest step whose start_synced_t <= t
         step_idx = int(np.searchsorted(step_starts, t, side="right") - 1)
@@ -229,15 +242,15 @@ def _featurize_session(sd: SessionData) -> pd.DataFrame:
             "window_end_synced_t": float(w_hi),
         }
 
-        # Pupil window slice
+        # Pupil window slice (10 s)
         if pupil_t is not None:
-            i_lo = int(np.searchsorted(pupil_t, w_lo, side="left"))
-            i_hi = int(np.searchsorted(pupil_t, w_hi, side="right"))
+            i_lo = int(np.searchsorted(pupil_t, wp_lo, side="left"))
+            i_hi = int(np.searchsorted(pupil_t, wp_hi, side="right"))
             sub = sd.pupil.iloc[i_lo:i_hi]
             feat.update(
                 pupil_features.extract(
                     sub,
-                    window_len_s=WINDOW_LEN_S,
+                    window_len_s=WINDOW_LEN_S_PUPIL,
                     expected_rate_hz_per_eye=EXPECTED_PUPIL_RATE_HZ,
                     baseline=sd.baseline,
                 )
@@ -245,30 +258,31 @@ def _featurize_session(sd: SessionData) -> pd.DataFrame:
         else:
             feat.update({k: float("nan") for k in pupil_features.PUPIL_FEATURE_NAMES})
 
-        # Fixations
+        # Fixations (30 s window for stable rate/duration estimates)
         if fix_t is not None:
-            i_lo = int(np.searchsorted(fix_t, w_lo, side="left"))
-            i_hi = int(np.searchsorted(fix_t, w_hi, side="right"))
+            i_lo = int(np.searchsorted(fix_t, wf_lo, side="left"))
+            i_hi = int(np.searchsorted(fix_t, wf_hi, side="right"))
             sub_f = sd.fixations.iloc[i_lo:i_hi]
-            feat.update(fixation_features.extract(sub_f, window_len_s=WINDOW_LEN_S))
+            feat.update(fixation_features.extract(sub_f, window_len_s=WINDOW_LEN_S_FIXATION))
         else:
             feat.update({k: float("nan") for k in fixation_features.FIXATION_FEATURE_NAMES})
             sub_f = pd.DataFrame()
 
-        # Blinks
+        # Blinks (60 s window — blinks are sparse; 10 s gave noisy 0-2 counts)
         if blink_starts is not None:
-            i_lo = int(np.searchsorted(blink_starts, w_lo, side="left"))
-            i_hi = int(np.searchsorted(blink_starts, w_hi, side="right"))
+            i_lo = int(np.searchsorted(blink_starts, wb_lo, side="left"))
+            i_hi = int(np.searchsorted(blink_starts, wb_hi, side="right"))
             sub_b = sd.blinks.iloc[i_lo:i_hi]
             feat.update(
                 blink_features.extract(
-                    sub_b, window_len_s=WINDOW_LEN_S, long_thresh_s=BLINK_LONG_THRESH_S
+                    sub_b, window_len_s=WINDOW_LEN_S_BLINK, long_thresh_s=BLINK_LONG_THRESH_S
                 )
             )
         else:
             feat.update({k: float("nan") for k in blink_features.BLINK_FEATURE_NAMES})
 
-        # Gaze
+        # Gaze still uses primary window (10 s) — kept for compatibility,
+        # though gaze features aren't in the active feature set per X_FEATURES.md.
         sub_g = None
         if gaze_t is not None:
             i_lo = int(np.searchsorted(gaze_t, w_lo, side="left"))
@@ -390,9 +404,9 @@ def _write_feature_dictionary(out_path: Path) -> None:
     # Blinks
     add("blink_count", "count of non-tracking-loss blinks in window", "n", "blinks_clean", "yes")
     add(
-        "blink_rate_per_min",
-        "blink_count * 60 / window_len_s",
-        "/min",
+        "blink_rate_30s",
+        "blink_count over the 30-second blink window (no /min extrapolation)",
+        "count/30s",
         "blinks_clean",
         "yes",
     )

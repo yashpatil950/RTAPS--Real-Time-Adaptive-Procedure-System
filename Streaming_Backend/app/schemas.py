@@ -112,8 +112,12 @@ class PredictionResponse(BaseModel):
     procedure_id: int
     step_number: int
     cumulative_session_time_s: float
+    # `workload_label` is the smoothed, displayable level (drives UI).
+    # `raw_workload_label` is the unsmoothed per-second model output (for QA).
     workload_label: str
+    raw_workload_label: str | None = None
     workload_proba: dict[str, float]
+    smoother_state: dict[str, Any] | None = None
     feature_values: dict[str, float | int | None]
     inference_source: str = Field(..., description="'local' or 'remote'")
     is_valid_window: bool = True
