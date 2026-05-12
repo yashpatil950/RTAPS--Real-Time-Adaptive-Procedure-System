@@ -1,4 +1,4 @@
-# RTAPS ML — Workload Classifier
+# RTAPS ML — Workload Classifier (v4)
 
 End-to-end pipeline for the **Real-Time Adaptive Procedure System** workload
 classifier. Eye-tracking signals (pupil, blinks, fixations) recorded while
@@ -11,20 +11,28 @@ This README is the deep dive — for the feature contract see
 [`X_FEATURES.md`](X_FEATURES.md), and for the live serving stack see
 [`Streaming_Backend/`](../Streaming_Backend/).
 
+**Current deployed model: `v4_rf_pnorm.joblib`** (Random Forest, sensor-only
+inputs, labels from k-means clustering of per-step VACP `p_normalized`).
+
 ---
 
 ## 1. Problem statement
 
 Predict the operator's **cognitive workload level** (low / medium / high) for
-the *current* procedure step, in real time, every second, using:
+the *current* procedure step, in real time, every second, using **only**
+eye-tracking signals:
 
-- the last 10 s of pupil samples (60 Hz/eye) for instantaneous load
-- the last 30 s of fixations for visual processing depth
-- the last 60 s of blinks for cognitive blink suppression
-- task context (which procedure, which step, how long they've been on task)
+- last **10 s** of pupil samples (60 Hz/eye) for pupil dilation and slope
+- last **30 s** of fixations for visual processing depth
+- last **30 s** of blinks for cognitive blink suppression
 
-Output drives a smoothed instruction display ("Slow down," "Continue,"
-"Take your time") via the `WorkloadSmoother` in the streaming backend.
+No `step_number`, no `procedure_id`, no session-clock features — those let
+the model fall back on a deterministic step-number lookup instead of learning
+from physiology. v4 strips them so the model is forced to use sensors.
+
+Output drives a smoothed instruction display (Low / Medium / High) via the
+`WorkloadSmoother` in the streaming backend. Low workload shows no extra
+guidance — the base step description is enough.
 
 ---
 
@@ -41,19 +49,20 @@ Output drives a smoothed instruction display ("Slow down," "Continue,"
                                                 │  Streaming_Backend (FastAPI) │
                                                 │  - /stream/pupil  /blinks    │
                                                 │    /fixations                │
+                                                │  - /session/calibration_*    │
                                                 │  - SessionState rolling buf  │
-                                                │  - BaselineTracker (120 s)   │
+                                                │  - BaselineTracker (Mode A)  │
                                                 │  - InferenceLoop (1 s tick)  │
                                                 │  - WorkloadSmoother (30 s)   │
-                                                │  - LocalPredictor (joblib)   │
+                                                │  - LocalPredictor → v4 RF    │
                                                 └─────────┬────────────────────┘
                                                           │  SSE
                                                           ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                       RTAPS Frontend (React)                                 │
-│  - shows step instruction (low/medium/high)                                  │
-│  - posts session/start, session/step_change, session/end                     │
-│  - eventually: calibration screen → POST /session/calibration_{start,end}    │
+│  - CalibrationScreen (120 s fixation cross BEFORE the procedure starts)      │
+│  - SessionView (step instructions; medium → high cumulative display)         │
+│  - StreamingDashboard (live ML preview of sensor values + predictions)       │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -64,11 +73,13 @@ Output drives a smoothed instruction display ("Slow down," "Continue,"
 02_clean_pupil_export    → tidy parquets + per-session pupil baseline (quietest 120 s)
 03_align_steps           → align RTAPS step boundaries to pupil clock
 04_extract_features      → 1 s decision grid → per-window feature rows
-04b_add_normalized       → add per-participant (_zp) and per-procedure (_zproc) z-scores
+                           (pupil 10 s window, fixation 30 s, blink 30 s)
+04b_add_normalized       → adds per-participant (_zp) and per-procedure (_zproc) z-scores
 05_summarize_per_step    → per-step QA aggregates
-06_train_classifier      → (legacy) train on weak proxy labels — kept as regression test
-07_train_vacp_model      → train on VACP labels with full feature set (lookup-table model v2)
-07a_train_sensors_only   → train sensors-only model (no step/procedure leakage) (model v3)
+06_train_classifier      → (legacy) weak proxy labels — kept as regression test only
+07_train_vacp_model      → (v2) VACP-tertile labels + step/procedure features → lookup model
+07a_train_sensors_only   → (v3) VACP-tertile labels, sensor-only X
+07c_train_rf_pnorm       → (v4 current) Random Forest, p_normalized k-means Y, sensor-only X
 ```
 
 ---
@@ -97,72 +108,54 @@ data/_processed/
   ├── step_alignment_summary.csv
   ├── X_window_summary.csv
   ├── feature_dictionary.md     # generated by stage 04
-  ├── Y labels/                 # VACP workload scores per step (Excel)
+  ├── Y labels/                 # VACP workload analysis (Excel, 3 procedures)
+  │   ├── *_vacp_workload.xlsx  # 3 sheets each:
+  │   │   ├── Operators         # per-operator VACP rows
+  │   │   ├── Legend & VACP     # weight reference (Zhu et al., 2025)
+  │   │   └── Step Summary      # per-step MWI + p_normalized (Y source for v4)
   └── {centrifuge,column_flushing,pressure_testing}/
-      ├── X_window.parquet      # primary training table (~17 700 windows total)
+      ├── X_window.parquet      # primary training table
       ├── X_step.parquet        # per-step aggregates
       └── per_session/<sid>/    # cleaned tidy parquets (gitignored)
 ```
 
 ---
 
-## 4. Features (X)
+## 4. Features (X) — the v4 contract
 
-Two feature sets exist depending on which model:
+**5 sensor-only features.** Order MUST match
+[`Streaming_Backend/app/feature_extractor.py`](../Streaming_Backend/app/feature_extractor.py)
+`FEATURE_NAMES`:
 
-### Lookup model (v2 — `06_train_classifier.py`, `07_train_vacp_model.py`) — 7 features
+| # | Feature | Window | Source | What it measures |
+|---|---|---|---|---|
+| 1 | `pupil_pcps_mean` | 10 s | pupil samples + per-session baseline | % change in pupil size vs. participant baseline (PCPS) |
+| 2 | `pupil_diam_slope` | 10 s | pupil samples (diameter vs. timestamp) | Within-window pupil dilation/constriction rate |
+| 3 | **`blink_rate_30s`** | **30 s** | blink onset events | Count of (non-tracking-loss) blinks in the last 30 s |
+| 4 | `fixation_dur_mean_ms` | 30 s | fixation events | Mean fixation duration in ms |
+| 5 | `fixation_dispersion_mean` | 30 s | fixation events | Within-fixation spatial jitter |
 
-| Feature | Source | Window |
-|---|---|---|
-| `pupil_pcps_mean` | pupil samples + per-session baseline | 10 s |
-| `blink_rate_per_min` | blink onset events | 60 s |
-| `fixation_dur_mean_ms` | fixation events | 30 s |
-| `fixation_dispersion_mean` | fixation events | 30 s |
-| `procedure_id` | RTAPS UI | — |
-| `step_number` | RTAPS UI | — |
-| `cumulative_session_time_s` | session start ts | — |
+**Important rename (v4):** `blink_rate_per_min` (60 s window, extrapolated to
+/min) → `blink_rate_30s` (raw count over a 30 s window). Reflected in
+[lib/blink_features.py](scripts/lib/blink_features.py), [lib/config.py](scripts/lib/config.py),
+[04_extract_features_window.py](scripts/04_extract_features_window.py),
+[04b_add_normalized_features.py](scripts/04b_add_normalized_features.py),
+[Streaming_Backend/app/feature_extractor.py](../Streaming_Backend/app/feature_extractor.py),
+and [RTAPS_Frontend/src/pages/StreamingDashboard.js](../RTAPS_Frontend/src/pages/StreamingDashboard.js).
 
-This model achieves 99.8 % accuracy but is essentially a lookup table:
-`(procedure_id, step_number)` deterministically predicts the VACP label, so
-the eye-tracking features show 0 % permutation importance. Useful as a
-deployment baseline (the predictions are "correct" in the VACP sense), but
-it does not respond to the operator's actual physiology.
+**What was removed from v3 → v4:** `procedure_id`, `step_number`,
+`cumulative_session_time_s`. These let the model bypass physiology and use
+a deterministic lookup — explicitly removed so v4 has to do real work.
 
-### Sensors-only model (v3 — `07a_train_sensors_only.py`) — 15 features
-
-5 raw sensor features × 3 normalization scopes:
-
-| Sensor | Raw | `_zp` (per-participant z-score) | `_zproc` (per-procedure z-score) |
-|---|---|---|---|
-| `pupil_pcps_mean` | ✓ | ✓ | ✓ |
-| `pupil_diam_slope` | ✓ | ✓ | ✓ |
-| `blink_rate_per_min` | ✓ | ✓ | ✓ |
-| `fixation_dur_mean_ms` | ✓ | ✓ | ✓ |
-| `fixation_dispersion_mean` | ✓ | ✓ | ✓ |
-
-No `step_number`, no `procedure_id`, no `cumulative_session_time_s` — the
-model is forced to derive predictions from physiology alone.
-
-### Why z-scoring matters
-
-- `_zp` (per-participant): each operator has different resting pupil size, blink
-  rate, fixation duration. Subtracting the participant's own mean and dividing
-  by their std exposes *deviation from their own normal* rather than absolute
-  values. This is the variation the model needs to learn.
-- `_zproc` (per-procedure): the three procedures were recorded on different
-  laptops with different lighting and cameras. Per-procedure z-scoring
-  removes hardware confounds so the workload signal isn't masked.
-
-### Per-feature window lengths
+### Per-feature window lengths (Phase 3 finding)
 
 Pupil samples are dense (~120 Hz across both eyes), so 10 s gives a stable
 mean. Fixations and blinks are sparse — a 10 s window often contains 0–2
-events, giving noisy rates. Phase 3 of the X→Y plan switched to:
+events, giving noisy rates. v4 uses:
 
 - **10 s** for pupil features (responsive)
 - **30 s** for fixation features (stable)
-- **60 s** for blink rate (revealed the cognitive blink suppression
-  effect — see §8)
+- **30 s** for blink rate (was 60 s in v3; user reduced to 30 s for v4)
 
 Predictions are still emitted every 1 s; only the buffer slice differs.
 
@@ -170,175 +163,159 @@ Predictions are still emitted every 1 s; only the buffer slice differs.
 
 ## 5. Pupil baseline strategy
 
-Pupil PCPS = `(current − baseline) / baseline` measures *how much this
-person's pupil deviates from their own resting state*. Picking the right
-baseline is critical.
-
-### Original (broken) — first 120 s of session
-
-```
-PCPS = (current − mean(first 120 s)) / mean(first 120 s)
-```
-
-For column_flushing the first step is "Prep to start task" (VACP = 170.1,
-the highest in the dataset). So the baseline was averaging the *busiest*
-period, making every later step look like pupil constriction. Pressure
-testing pupil_pcps means came out systematically negative (−0.10 to −0.20).
-
-### Current — quietest 120 s window in session
+### Training (offline)
 
 `02_clean_pupil_export.py::_compute_baseline` scans the entire session in
-30-second strides. For each candidate 120 s window, it counts blinks +
-fixations and picks the window with the lowest combined count. The baseline
-is the mean pupil diameter inside that window.
+30-second strides. For each candidate 120-second window, it counts blinks +
+fixations and picks the window with the lowest combined count. Baseline =
+mean pupil diameter inside that window.
 
 ```
-strategy = "quietest_window"   if a calm 120 s exists with ≥ 120 pupil samples
-         = "session_median"     fallback if no candidate qualifies
-         = "session_median_short" fallback if session < 120 s
+strategy = "quietest_window"       if a calm 120 s exists with ≥ 120 samples
+         = "session_median"        fallback if no candidate qualifies
+         = "session_median_short"  fallback if session < 120 s
 ```
 
-All 16 pupil-bearing sessions in the current dataset use `quietest_window`
-— no fallbacks. Metadata for each baseline is recorded in `baselines.csv`:
-`baseline_strategy`, `baseline_window_start_synced_t`, `n_blinks`, etc.
+All 16 pupil-bearing sessions in the current dataset use `quietest_window`.
 
-### Future — explicit calibration phase (planned, see Phase 8 in the plan)
+### Live serving — calibration phase (NEW in v4)
 
-The right design is a dedicated calibration phase before procedure step 1:
+The deployed pipeline now has an **explicit calibration period** before the
+procedure starts. The frontend shows a fixation cross for 120 seconds while
+the operator sits calmly; the backend's `BaselineTracker` runs in **Mode A
+(explicit calibration)** and accumulates samples only during that window:
 
 ```
-[ Operator puts on device ]
-        │
-        ▼
-[ CALIBRATION: 120 s, fixation cross, no task demands ]    ← baseline collected here
-        │
-        ▼
-[ PROCEDURE: step 1, step 2, ... ]                         ← PCPS uses frozen baseline
+[ Operator puts on Pupil Capture ]
+         │
+         ▼
+[ POST /session/calibration_start ]      ← frontend mounts CalibrationScreen
+         │  (backend resets accumulator, marks calibrating=true)
+         ▼
+[ Pupil samples stream for 120 s  ]      ← BaselineTracker.add() collects them
+         │  (no procedure timer yet; predictions still suppressed)
+         ▼
+[ POST /session/calibration_end ]        ← frontend countdown completes
+         │  (backend freezes PupilBaseline)
+         ▼
+[ POST /session/start ]                  ← procedure begins from step 1
+         │  (session_started_at = calibration_end timestamp)
+         ▼
+[ First prediction emitted after 10 s of step-1 data ]
 ```
 
-This matches standard pupillometry methodology (Beatty 1982). The legacy
-quietest-window strategy is a workaround for the existing dataset, which
-has no calibration recording.
+The backend also keeps a **Mode B (legacy auto-start)** code path for
+backwards compatibility with older clients that don't call `calibration_*`
+endpoints — in that case the first pupil sample seeds an implicit 120 s
+calibration window. Mode A is preferred because it guarantees the baseline
+captures rest (no task work).
 
 ---
 
-## 6. Labels (Y)
+## 6. Labels (Y) — `p_normalized` clustering
 
-### VACP-based step-level labels (current)
+`p_normalized` is the per-step VACP MWI normalized to the procedure's max
+MWI (range 0–1). Computed and stored in each procedure's
+`Step Summary` sheet:
 
-VACP (Visual, Auditory, Cognitive, Psychomotor) is a validated cognitive
-task analysis method. For each step of each procedure, every operator
-action (grasp, look, read, verify, recall, turn, …) was decomposed and
-assigned a standardized weight from Zhu et al. (2025). The total VACP
-score for a step is the sum of operator weights.
+```
+p_normalized = step_VACP_total / max(step_VACP_total across that procedure's steps)
+```
 
-Source: `data/_processed/Y labels/{centrifuge,column_flushing,pressure_testing}_vacp_workload.xlsx`
+v4 uses **k-means with k=3** on the 35 step-level `p_normalized` values
+(step 0 excluded across all 3 procedures) to find the natural breakpoints
+between low / medium / high workload:
 
-35 steps total (step 0 — "Prep to start task" — excluded for all 3 procedures).
+- **Cluster centers:** 0.117, 0.299, 0.845
+- **Boundaries:** `low ≤ 0.208`, `medium ≤ 0.572`, `high > 0.572`
+- **Step-level class distribution:** 16 low, 15 medium, 4 high
 
-Labels are assigned by **global tertile** of the VACP score:
+Every 1 s window inherits its step's label. **All labels come from the user's
+hand-curated VACP analysis — no proxy, no fake data.**
 
-| Class | Range | Count |
-|---|---|---|
-| `low` | VACP ≤ 25.6 | 11 steps |
-| `medium` | 25.6 < VACP ≤ 42.7 | 13 steps |
-| `high` | VACP > 42.7 | 11 steps |
+### UI rendering rule
 
-### Limitation
-
-VACP labels are **identical for every participant doing the same step**. So
-within-step variation in physiology (one operator finds it easy, another
-struggles) has no corresponding variation in labels. This is why sensors
-struggle to learn beyond chance level — the labels can't reward them for
-detecting individual differences.
-
-The next ground-truth tier is **NASA-TLX** collected per-participant
-per-step (planned as Phase 7 / escape hatch). Until then, sensors are
-constrained to learning between-step patterns only.
+The frontend [SessionView.js](../RTAPS_Frontend/src/pages/SessionView.js) only
+renders extra guidance when the workload reaches medium or high. **Low →
+nothing shown** (the base step description is enough). When the level
+escalates within a step (e.g., medium → high), the previous medium block
+stays visible and the new high block is added on top (cumulative).
 
 ---
 
-## 7. Models trained
+## 7. Model — Random Forest
 
-| Model | Script | Features | Use |
-|---|---|---|---|
-| `v1_hgb_weak.joblib` | `06_train_classifier.py` | 7 (legacy proxy labels) | Pipeline regression test only — do not deploy |
-| `v2_hgb_vacp.joblib` | `07_train_vacp_model.py` | 7 (incl. step_number, procedure_id) | Lookup model. Reliable per-step instruction display |
-| `v3_hgb_sensors_only.joblib` | `07a_train_sensors_only.py` | 15 sensor-only | Physiological state monitor. Not yet reliable enough as primary |
-
-All three use **`HistGradientBoostingClassifier`** (scikit-learn). It handles
-NaN inputs natively, supports `categorical_features` for `procedure_id`, and
-has built-in early stopping. Cross-validation uses **`GroupKFold` with
-`participant_id` as the group**, so no participant ever appears in both
-train and test of any fold (prevents within-subject leakage).
-
-### v3 — sensors-only details
+`07c_train_rf_pnorm.py` builds a `sklearn.pipeline.Pipeline`:
 
 ```python
-HistGradientBoostingClassifier(
-    max_depth=5,
-    learning_rate=0.05,
-    max_iter=500,
-    l2_regularization=1.0,
-    early_stopping=True,
-    validation_fraction=0.15,
-    n_iter_no_change=30,
-    random_state=42,
-    class_weight="balanced",
-)
+Pipeline([
+    ("impute", SimpleImputer(strategy="median")),
+    ("rf", RandomForestClassifier(
+        n_estimators=400,
+        max_depth=12,
+        min_samples_leaf=20,
+        min_samples_split=10,
+        max_features="sqrt",
+        class_weight="balanced",
+        n_jobs=-1,
+        random_state=42,
+    )),
+])
 ```
 
-- 5-fold GroupKFold over 11 participants (~2 participants held out per fold)
-- 17,599 windows after filtering (across 3 procedures)
-- Class distribution: high 10,217 / medium 4,043 / low 3,339 (skew toward
-  high because long high-VACP centrifuge step 3 dominates the window count)
+- **`SimpleImputer`** handles NaN sensor values (RF can't take NaN natively).
+- **`class_weight="balanced"`** compensates for the skew toward "low" /
+  "high" classes (medium is the smallest).
+- **5-fold `GroupKFold`** over 11 participants — no participant ever
+  appears in both train and test of any fold.
+
+| Model | Script | Features | Y labels | Use |
+|---|---|---|---|---|
+| `v1_hgb_weak.joblib` | `06_train_classifier.py` | 7 (legacy proxy labels) | weak rule | Pipeline regression test only |
+| `v2_hgb_vacp.joblib` | `07_train_vacp_model.py` | 7 (incl. step_number, procedure_id) | VACP tertile | Lookup model — accurate but doesn't use sensors |
+| `v3_hgb_sensors_only.joblib` | `07a_train_sensors_only.py` | 15 sensor-only | VACP tertile | Sensors-only HGB benchmark |
+| **`v4_rf_pnorm.joblib`** (deployed) | **`07c_train_rf_pnorm.py`** | **5 sensor-only** | **p_normalized k-means** | **Current production target** |
 
 ---
 
-## 8. Current metrics
+## 8. v4 metrics (5-fold GroupKFold OOF)
 
-### v2 lookup model (proxy for "VACP-correct" predictions per step)
-
-| Level | Accuracy | Balanced acc | Macro F1 | Cohen's κ |
+| Level | Accuracy | Balanced Acc | Macro F1 | Cohen's κ |
 |---|---|---|---|---|
-| Window | 0.998 | 0.998 | 0.998 | 0.997 |
-| Step (majority) | 0.992 | 0.993 | 0.993 | 0.989 |
+| Window | 0.361 | 0.337 | 0.338 | +0.023 |
+| Step (majority) | 0.317 | 0.341 | 0.295 | −0.024 |
 
-Drives the deployed instruction display. Permutation importance — `step_number`
-63 %, `procedure_id` 28 %, sensors 0 % (not actually using physiology).
+Per-class F1: low 0.40 / medium 0.18 / high 0.43.
 
-### v3 sensors-only model (the real-time physiological detector)
+**Feature importance (permutation, on F1-macro):**
 
-| Level | Accuracy | Balanced acc | Macro F1 | Cohen's κ |
-|---|---|---|---|---|
-| Window | 0.437 | 0.352 | 0.347 | +0.022 |
-| Step (majority) | 0.397 | 0.393 | 0.378 | +0.091 |
-
-Top features by permutation importance:
-
-| Feature | Importance |
+| Feature | Permutation Importance |
 |---|---|
-| `blink_rate_per_min_zproc` | 16.0 % |
-| `pupil_pcps_mean` | 10.1 % |
-| `blink_rate_per_min_zp` | 8.0 % |
-| `fixation_dispersion_mean_zp` | 7.4 % |
-| `fixation_dur_mean_ms_zp` | 6.4 % |
+| `blink_rate_30s` | **0.227** |
+| `pupil_pcps_mean` | 0.207 |
+| `fixation_dur_mean_ms` | 0.184 |
+| `fixation_dispersion_mean` | 0.152 |
+| `pupil_diam_slope` | 0.028 |
 
-### Honest read
+All five sensor features contribute non-zero importance — sensors are
+**actually being used** (vs. v2 where they were 0%).
 
-The v3 model demonstrates that **sensors carry real workload signal**
-(blink rate strongly drops on high-VACP centrifuge steps — Spearman ρ = −0.60
-within centrifuge — matching cognitive blink suppression in the literature).
-But the achieved κ = +0.022 falls well short of the κ ≥ 0.40 plan target.
+### Honest assessment
 
-The ceiling is set by **step-level labels** (everyone doing step 6 gets
-the same label even when one operator is breezing through and another is
-struggling). Reaching κ ≥ 0.40 requires either:
-- **NASA-TLX labels** (per-participant, per-step) — gold-standard fix
-- **Window-level VACP labels** (parsing operator timing within each step) — needs richer Cogulator output
+κ = +0.023 means **v4 is barely above chance** on a 3-class problem (random
+guessing = 33%). The structural reason: step-level labels assign the same
+class to every window of a step, so within-step physiological variation has
+no Y signal to learn against. With only 11 participants, that's the ceiling
+this dataset can produce. Two paths past it:
 
-For now, the deployed system uses **v2 (lookup) for the primary instruction**
-and treats v3 as an experimental physiological monitor.
+1. **NASA-TLX collection** (gold standard) — per-participant per-step rating
+   gives the within-class variation sensors need.
+2. **Window-level VACP** — partial fix, needs richer operator timing data.
+
+Until then, v4 is best deployed *alongside* v2 (lookup) as a sensor-anomaly
+monitor, not as the primary instruction driver. The current deployment in
+`Streaming_Backend/app/config.py` points to v4 for development; in
+production this can be swapped to v2 by setting `MODEL_PATH` env var.
 
 ---
 
@@ -352,7 +329,7 @@ GroupKFold(n_splits=5, group=participant_id)
 - No participant appears in both train and test of any fold
 - Reported metrics are out-of-fold (OOF) — never tested on training data
 - Per-participant balanced accuracy is also reported in
-  `models/sensors_per_participant.csv` to detect collapse on individuals
+  `models/rf_per_participant.csv` to detect collapse on individuals
 
 ---
 
@@ -367,11 +344,10 @@ pip install -r scripts/requirements.txt
 python scripts/01_build_session_index.py
 python scripts/02_clean_pupil_export.py        # quietest-120s baseline
 python scripts/03_align_steps.py
-python scripts/04_extract_features_window.py   # per-feature windows
+python scripts/04_extract_features_window.py   # per-feature windows (pupil 10s, fix 30s, blink 30s)
 python scripts/04b_add_normalized_features.py  # _zp and _zproc features
 python scripts/05_summarize_per_step.py
-python scripts/07_train_vacp_model.py          # v2 lookup model
-python scripts/07a_train_sensors_only.py       # v3 sensors-only model
+python scripts/07c_train_rf_pnorm.py           # v4 — current production target
 ```
 
 `scripts/lib/config.py` is the single source of truth for window lengths,
@@ -383,31 +359,25 @@ matches training.
 
 ## 11. Live serving contract
 
-`Streaming_Backend/app/feature_extractor.py` must emit the **same feature
-columns** as the trained model expects. The `LocalPredictor` validates this
-on load and refuses to start if there's a mismatch.
+`Streaming_Backend/app/feature_extractor.py::FEATURE_NAMES` must equal v4's
+`FEATURE_COLS`. The `LocalPredictor` validates this on load and refuses to
+start on mismatch:
 
 ```python
 # Training-time and serving-time MUST agree:
 FEATURE_NAMES = (
     "pupil_pcps_mean",
-    "blink_rate_per_min",
+    "pupil_diam_slope",
+    "blink_rate_30s",
     "fixation_dur_mean_ms",
     "fixation_dispersion_mean",
-    "procedure_id",
-    "step_number",
-    "cumulative_session_time_s",
 )
 ```
 
-The streaming backend's `BaselineTracker` (currently uses first 120 s of
-pupil data) needs to be upgraded to a calibration-phase tracker (Phase 8
-in the plan) before deploying with real operators — without this, the
-training-vs-serving baseline mismatch will corrupt PCPS values.
-
 `WorkloadSmoother` (30 s stability window + direction guard) handles
 instruction-display stability so the on-screen feedback doesn't flip every
-second between low/medium/high.
+second between low/medium/high. See
+[Streaming_Backend/app/workload_smoother.py](../Streaming_Backend/app/workload_smoother.py).
 
 ---
 
@@ -427,7 +397,8 @@ ML Algorithm/
 │   ├── 05_summarize_per_step.py
 │   ├── 06_train_classifier.py        # v1 — weak labels (legacy)
 │   ├── 07_train_vacp_model.py        # v2 — VACP labels, full features (lookup)
-│   ├── 07a_train_sensors_only.py     # v3 — sensors only (no leakage)
+│   ├── 07a_train_sensors_only.py     # v3 — sensors only (HGB)
+│   ├── 07c_train_rf_pnorm.py         # v4 — RF + p_normalized k-means (current)
 │   ├── lib/                          # shared modules
 │   │   ├── config.py                 # window lengths, thresholds
 │   │   ├── pupil_features.py
@@ -447,11 +418,11 @@ ML Algorithm/
 │   └── _processed/                   # derived; small QA artifacts committed
 │       ├── session_index.csv
 │       ├── procedure_steps.csv
-│       ├── baselines.csv             # NEW: includes baseline_strategy column
+│       ├── baselines.csv             # includes baseline_strategy column
 │       ├── data_quality.csv
 │       ├── feature_dictionary.md
 │       ├── Y labels/
-│       │   ├── centrifuge_vacp_workload.xlsx
+│       │   ├── centrifuge_vacp_workload.xlsx     # 3 sheets each
 │       │   ├── column_flushing_vacp_workload.xlsx
 │       │   └── pressure_testing_vacp_workload.xlsx
 │       └── {centrifuge,column_flushing,pressure_testing}/
@@ -460,20 +431,16 @@ ML Algorithm/
 │           └── per_session/<sid>/    (gitignored)
 └── models/
     ├── v1_hgb_weak.joblib            # (legacy)
-    ├── v2_hgb_vacp.joblib            # currently deployed (lookup model)
-    ├── v3_hgb_sensors_only.joblib    # experimental sensors-only
-    ├── cv_metrics.json
-    ├── vacp_cv_metrics.json
-    ├── sensors_cv_metrics.json
-    ├── feature_importance.csv
-    ├── vacp_feature_importance.csv
-    ├── sensors_feature_importance.csv
-    ├── confusion_matrix_window.csv   ─┐
-    ├── confusion_matrix_step.csv      │ window/step level OOF confusion
-    ├── vacp_confusion_window.csv      │
-    ├── vacp_confusion_step.csv        │
-    ├── sensors_confusion_window.csv   │
-    └── sensors_confusion_step.csv    ─┘
+    ├── v2_hgb_vacp.joblib            # lookup model (VACP labels)
+    ├── v3_hgb_sensors_only.joblib    # sensors-only HGB
+    ├── v4_rf_pnorm.joblib            # CURRENT — sensor-only RF, p_normalized labels
+    ├── rf_cv_metrics.json            # v4 metrics
+    ├── rf_feature_importance.csv
+    ├── rf_oof_window.parquet
+    ├── rf_oof_step.parquet
+    ├── rf_confusion_window.csv
+    ├── rf_confusion_step.csv
+    └── rf_per_participant.csv
 ```
 
 ---
@@ -481,10 +448,11 @@ ML Algorithm/
 ## 13. Where the rest of the system lives
 
 - Live serving: [`../Streaming_Backend/`](../Streaming_Backend/) — FastAPI app
-  that ingests Pupil Capture data, runs the model every second, and pushes
-  smoothed predictions to the frontend via SSE.
+  that ingests Pupil Capture data, gates predictions behind calibration,
+  runs the v4 model every second, and pushes smoothed predictions to the
+  frontend via SSE.
 - Frontend: [`../RTAPS_Frontend/`](../RTAPS_Frontend/) — React app showing
-  procedure steps and live workload feedback.
+  the CalibrationScreen, procedure steps, and live workload feedback.
 - Capture bridge: [`../Streaming_Backend/pupil_capture_bridge.py`](../Streaming_Backend/pupil_capture_bridge.py)
   — runs on the laptop with Pupil Capture open; subscribes to ZMQ topics
   and forwards to the backend.
@@ -493,16 +461,15 @@ ML Algorithm/
 
 ## 14. Open issues and roadmap
 
-1. **Calibration phase** (Phase 8 of the plan) — add an explicit pre-procedure
-   calibration screen so the baseline reflects true rest, not task work.
-   Required before deploying with real operators.
-2. **NASA-TLX labels** (Phase 7) — gold-standard individual workload labels.
+1. **NASA-TLX labels** — gold-standard individual workload labels.
    Single biggest lever for raising κ to ≥ 0.40.
-3. **Window-level VACP** (Phase 4) — distribute operator-level VACP scores
+2. **Window-level VACP** — distribute operator-level VACP scores
    over time within each step. Needs operator timing data; deferred.
-4. **End-to-end replay test** — run an existing offline session through the
+3. **End-to-end replay test** — run an existing offline session through the
    live `Streaming_Backend` and compare features + predictions to training
    values. Prerequisite for trusting any deployed prediction.
+4. **More participants** — 11 is small. With 25-30 you'd have more cross-
+   validation power.
 
 References:
 - [`X_FEATURES.md`](X_FEATURES.md) — canonical feature spec

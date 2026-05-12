@@ -81,6 +81,22 @@ class StepChangeRequest(BaseModel):
     step_id: int | None = None
 
 
+class CalibrationStartRequest(BaseModel):
+    """Frontend signal: operator is now sitting calmly looking at the
+    fixation cross. Backend begins accumulating pupil samples into the
+    baseline. The procedure does NOT yet start."""
+
+    stream_id: str
+
+
+class CalibrationEndRequest(BaseModel):
+    """Frontend signal: calibration period is over. Backend freezes the
+    baseline. The procedure can now begin and step 1 will see a fully
+    formed baseline."""
+
+    stream_id: str
+
+
 class SessionEndRequest(BaseModel):
     stream_id: str
 
@@ -132,6 +148,11 @@ class SessionStateView(BaseModel):
     step_number: int | None
     participant_id: str | None
     session_started_at: float | None
+    calibration_started_at: float | None = None
+    calibration_ended_at: float | None = None
+    calibrating: bool = False
+    baseline_mode: str = ""
+    baseline_seconds_remaining: float | None = None
     latest_pupil_t: float | None
     latest_prediction_at: float | None
     pupil_samples_buffered: int

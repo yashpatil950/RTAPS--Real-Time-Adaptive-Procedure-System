@@ -68,6 +68,25 @@ export async function streamingSessionStart({ streamId, procedureId, participant
   });
 }
 
+/**
+ * Calibration phase — operator sits calmly at a fixation cross while the
+ * backend accumulates pupil samples for the baseline. Procedure does not
+ * start until streamingCalibrationEnd() succeeds.
+ */
+export async function streamingCalibrationStart(streamId) {
+  return streamingFetch('/session/calibration_start', {
+    method: 'POST',
+    body: JSON.stringify({ stream_id: streamId }),
+  });
+}
+
+export async function streamingCalibrationEnd(streamId) {
+  return streamingFetch('/session/calibration_end', {
+    method: 'POST',
+    body: JSON.stringify({ stream_id: streamId }),
+  });
+}
+
 export async function streamingStepChange({ streamId, stepNumber, stepId }) {
   return streamingFetch('/session/step_change', {
     method: 'POST',

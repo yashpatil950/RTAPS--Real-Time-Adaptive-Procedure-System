@@ -13,6 +13,12 @@ import {
   streamingSessionEnd,
   subscribePredictions,
 } from '../services/streamingApi';
+import CalibrationScreen from '../components/CalibrationScreen';
+
+// How long the operator sits at the fixation cross before the procedure starts.
+// Must match Streaming_Backend `BASELINE_DURATION_S` (default 120 s) so the
+// frontend countdown matches what the backend needs.
+const CALIBRATION_DURATION_S = 120;
 
 // Workload level ordering — used to compute "highest level reached so far".
 // When the operator's predicted workload escalates (e.g. medium → high), we
@@ -35,7 +41,17 @@ const SessionView = () => {
     }
   }, [procedure, navigate]);
   
-  const [sessionStartTime] = useState(new Date());
+  // Gates: calibration must complete before the procedure UI engages. If
+  // streaming is disabled (no ML), calibration is skipped so the UI is
+  // immediately usable for offline rehearsal.
+  const streamingEnabled =
+    typeof window !== 'undefined' && isStreamingIntegrationEnabled();
+  const [calibrationComplete, setCalibrationComplete] = useState(
+    !streamingEnabled
+  );
+  // Defer the procedure clock until AFTER calibration finishes — that way step
+  // 1's elapsed time starts at 0, not at "120 s into the page mount".
+  const [sessionStartTime, setSessionStartTime] = useState(null);
   const [stepStartTimes, setStepStartTimes] = useState({});
   const [stepTimes, setStepTimes] = useState({});
   const [completedSteps, setCompletedSteps] = useState(new Set());
@@ -82,6 +98,14 @@ const SessionView = () => {
       setStreamingHookReady(false);
       return undefined;
     }
+    // Don't start the procedure session on the backend until calibration ends.
+    // session/start anchors the procedure clock — if we POST it during
+    // calibration, the first step gets counted from second 0 of the calibration
+    // period instead of from when the operator actually started step 1.
+    if (!calibrationComplete) {
+      setStreamingHookReady(false);
+      return undefined;
+    }
     let cancelled = false;
     setStreamingHookReady(false);
 
@@ -116,7 +140,7 @@ const SessionView = () => {
       setStreamingHookReady(false);
       streamingSessionEnd(sid).catch(() => {});
     };
-  }, [procedure?.id, trainNumber]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [procedure?.id, trainNumber, calibrationComplete]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!procedure || typeof window === 'undefined') return undefined;
@@ -192,15 +216,15 @@ const SessionView = () => {
     return cleanup;
   }, [procedure, trainNumber, streamingHookReady]);
 
-  // Initialize step start times - only start the first step
+  // Initialize step start times — only AFTER calibration completes, so the
+  // first step's elapsed time starts at 0 (not at "120 s into the page mount").
   useEffect(() => {
-    if (procedure && procedure.steps && procedure.steps.length > 0) {
-      const initialTimes = {};
-      // Only start timer for the first step
-      initialTimes[procedure.steps[0].id] = new Date();
-      setStepStartTimes(initialTimes);
-    }
-  }, [procedure]);
+    if (!procedure || !procedure.steps || procedure.steps.length === 0) return;
+    if (!calibrationComplete) return;
+    const now = new Date();
+    setSessionStartTime(now);
+    setStepStartTimes({ [procedure.steps[0].id]: now });
+  }, [procedure, calibrationComplete]);
 
   useEffect(() => {
     if (!procedure || !procedure.steps) return;
@@ -249,7 +273,9 @@ const SessionView = () => {
         if (!hasSavedAnalyticsRef.current) {
           hasSavedAnalyticsRef.current = true;
           try {
-            const totalTimeSec = Math.floor((end - sessionStartTime) / 1000) + devExtraSeconds;
+            const totalTimeSec = sessionStartTime == null
+              ? 0
+              : Math.floor((end - sessionStartTime) / 1000) + devExtraSeconds;
             const stepSummaries = procedure.steps.map((s) => ({
               stepId: s.id,
               stepNumber: s.stepNumber,
@@ -343,8 +369,24 @@ const SessionView = () => {
     );
   }
 
+  // Show the calibration overlay until the operator has sat through the
+  // baseline period. Skips entirely if streaming integration is disabled.
+  const showCalibration = streamingEnabled && !calibrationComplete;
+  const streamIdForCalibration = streamingEnabled
+    ? ensureStoredStreamId(procedure.id, trainNumber).trim()
+    : '';
+
   return (
     <div className="space-y-6">
+      {showCalibration && streamIdForCalibration && (
+        <CalibrationScreen
+          streamId={streamIdForCalibration}
+          baselineDurationS={CALIBRATION_DURATION_S}
+          onComplete={() => setCalibrationComplete(true)}
+          onCancel={() => setCalibrationComplete(true)}
+        />
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <button
@@ -426,9 +468,11 @@ const SessionView = () => {
           <div></div>
         </div>
         <div className={`text-4xl font-bold mb-2 ${isSessionComplete ? 'text-green-600' : 'text-blue-600'}`}>
-          {isSessionComplete 
-            ? formatTime(Math.floor((sessionEndTime - sessionStartTime) / 1000) + devExtraAtEnd)
-            : formatTime(Math.floor((new Date() - sessionStartTime) / 1000) + devExtraSeconds)
+          {sessionStartTime == null
+            ? formatTime(0)
+            : isSessionComplete
+              ? formatTime(Math.floor((sessionEndTime - sessionStartTime) / 1000) + devExtraAtEnd)
+              : formatTime(Math.floor((new Date() - sessionStartTime) / 1000) + devExtraSeconds)
           }
         </div>
         <div className="text-gray-600">
@@ -752,9 +796,11 @@ const SessionView = () => {
             <Clock className="w-6 h-6 text-green-600" />
           </div>
           <h3 className="text-lg font-semibold text-gray-900">
-            {isSessionComplete 
-              ? formatTime(Math.floor((sessionEndTime - sessionStartTime) / 1000))
-              : formatTime(Math.floor((new Date() - sessionStartTime) / 1000))
+            {sessionStartTime == null
+              ? formatTime(0)
+              : isSessionComplete
+                ? formatTime(Math.floor((sessionEndTime - sessionStartTime) / 1000))
+                : formatTime(Math.floor((new Date() - sessionStartTime) / 1000))
             }
           </h3>
           <p className="text-gray-600">

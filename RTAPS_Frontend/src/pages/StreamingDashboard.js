@@ -37,15 +37,14 @@ import {
   setStreamingIntegrationEnabled,
 } from '../services/streamingApi';
 
+// v4 sensor-only feature set — matches Streaming_Backend feature_extractor.FEATURE_NAMES
+// and ML Algorithm 07c_train_rf_pnorm.py FEATURE_COLS.
 const FEATURE_ORDER = [
   'pupil_pcps_mean',
   'pupil_diam_slope',
-  'blink_rate_per_min',
+  'blink_rate_30s',
   'fixation_dur_mean_ms',
   'fixation_dispersion_mean',
-  'procedure_id',
-  'step_number',
-  'cumulative_session_time_s',
 ];
 
 const PROCEDURE_NAMES = {

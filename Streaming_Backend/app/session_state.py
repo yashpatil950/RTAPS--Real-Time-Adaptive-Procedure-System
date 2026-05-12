@@ -62,48 +62,155 @@ class _FixRec:
 
 
 class BaselineTracker:
-    """Accumulates the first `baseline_duration_s` of confidence-filtered pupil
-    samples per eye, then freezes a `PupilBaseline`. Live predictions are
-    suppressed by `InferenceLoop` until `is_ready()` returns True.
+    """Per-session pupil baseline tracker — calibration-phase aware.
+
+    Two modes:
+
+    **Mode A — explicit calibration (preferred, new):** Frontend POSTs
+    `/session/calibration_start` then waits `baseline_duration_s` (e.g.
+    120 s) while showing a fixation cross with no task demands, then POSTs
+    `/session/calibration_end`. While calibration is active, every
+    confidence-filtered pupil sample is accumulated. On `calibration_end`,
+    the baseline is **frozen** and predictions become enabled. The
+    procedure does NOT start until calibration ends, so step 1 sees a
+    fully-formed baseline from second 0.
+
+    **Mode B — legacy auto-start (backwards-compatible):** If the
+    frontend never calls `calibration_start`, the tracker falls back to
+    the previous behavior: the first pupil sample seeds the start of an
+    implicit calibration window, samples accumulate for
+    `baseline_duration_s`, and finalize happens automatically. Used for
+    integration with existing offline data / older clients.
+
+    The two modes use the same accumulator buffer; what differs is the
+    *gating* of `add()` and the way `is_ready()` is set.
     """
 
     def __init__(self, baseline_duration_s: float, min_confidence: float):
         self._baseline_duration_s = baseline_duration_s
         self._min_confidence = min_confidence
-        self._started_at: Optional[float] = None
+        # Mode A markers:
+        # `_explicit_mode` flips to True as soon as the frontend says
+        # calibration_start, even if no pupil samples have arrived yet.
+        # `_calibration_started_at` is anchored to the FIRST pupil sample
+        # received after the start signal (so we know when to count from
+        # for the duration window).
+        self._explicit_mode: bool = False
+        self._calibration_started_at: Optional[float] = None
+        self._calibration_ended_at: Optional[float] = None
+        # Mode B implicit start:
+        self._auto_started_at: Optional[float] = None
+        # Accumulators:
         self._samples_eye0: list[float] = []
         self._samples_eye1: list[float] = []
         self._baseline: Optional[PupilBaseline] = None
+
+    # ---- explicit calibration markers (Mode A) -------------------------- #
+
+    def mark_calibration_start(self, t: Optional[float]) -> None:
+        """Frontend signal: calibration phase has begun. Future pupil samples
+        will be accumulated as baseline data."""
+        if self._baseline is not None:
+            return  # already finalized; ignore late starts
+        self._explicit_mode = True
+        # If `t` is None we don't know the pupil clock yet — the first
+        # incoming pupil sample will anchor `_calibration_started_at`.
+        self._calibration_started_at = t
+        # Reset any partial Mode B accumulation if we had one — explicit
+        # calibration takes precedence.
+        self._auto_started_at = None
+        self._samples_eye0.clear()
+        self._samples_eye1.clear()
+
+    def mark_calibration_end(self, t: Optional[float]) -> bool:
+        """Frontend signal: calibration phase has ended. Finalize the
+        baseline using whatever samples are in the accumulator. Returns
+        True if a baseline was successfully frozen.
+        """
+        if self._baseline is not None:
+            return False
+        self._calibration_ended_at = t
+        return self._finalize_now()
+
+    def calibrating(self) -> bool:
+        """True iff explicit calibration has started but not ended."""
+        return (
+            self._explicit_mode
+            and self._calibration_ended_at is None
+            and self._baseline is None
+        )
+
+    # ---- sample ingress ------------------------------------------------- #
 
     def add(self, sample: _PupilRec) -> None:
         if self._baseline is not None:
             return
         if sample.confidence < self._min_confidence:
             return
-        if self._started_at is None:
-            self._started_at = sample.t
-        if sample.t - self._started_at > self._baseline_duration_s:
+
+        # Mode A: explicit calibration is in progress → accept samples,
+        # anchoring `_calibration_started_at` to this first sample if the
+        # frontend's `calibration_start` arrived before any pupil data.
+        if self._explicit_mode and self._calibration_ended_at is None:
+            if self._calibration_started_at is None:
+                self._calibration_started_at = sample.t
+            self._accumulate(sample)
             return
+
+        # Mode A finalized (calibration_ended_at set) → samples should
+        # belong to procedure, NOT to the baseline. Ignore for baseline
+        # purposes (they still get appended to the rolling pupil deque
+        # elsewhere).
+        if self._explicit_mode and self._calibration_ended_at is not None:
+            return
+
+        # Mode B (legacy): no explicit calibration. Accumulate from first
+        # sample for baseline_duration_s.
+        if self._auto_started_at is None:
+            self._auto_started_at = sample.t
+        if sample.t - self._auto_started_at > self._baseline_duration_s:
+            return
+        self._accumulate(sample)
+
+    def _accumulate(self, sample: _PupilRec) -> None:
         if sample.eye_id == 0:
             self._samples_eye0.append(sample.diameter)
         else:
             self._samples_eye1.append(sample.diameter)
 
+    # ---- finalization --------------------------------------------------- #
+
     def maybe_finalize(self, latest_t: float) -> bool:
-        """Finalize if enough wall time has passed. Returns True if newly ready."""
-        if self._baseline is not None or self._started_at is None:
+        """Mode B auto-finalize: returns True if newly ready.
+
+        For Mode A, finalization happens explicitly via mark_calibration_end().
+        """
+        if self._baseline is not None:
             return False
-        if latest_t - self._started_at < self._baseline_duration_s:
+        # Don't auto-finalize during explicit calibration — wait for the end signal.
+        if self._explicit_mode:
             return False
+        if self._auto_started_at is None:
+            return False
+        if latest_t - self._auto_started_at < self._baseline_duration_s:
+            return False
+        return self._finalize_now()
+
+    def _finalize_now(self) -> bool:
         e0 = float(np.mean(self._samples_eye0)) if self._samples_eye0 else math.nan
         e1 = float(np.mean(self._samples_eye1)) if self._samples_eye1 else math.nan
         finite = [b for b in (e0, e1) if not math.isnan(b)]
         mean_mm = float(np.mean(finite)) if finite else math.nan
+        if math.isnan(mean_mm):
+            # No usable samples → keep waiting (Mode A may receive more data
+            # before user closes; Mode B effectively retries on next sample).
+            return False
         self._baseline = PupilBaseline(eye0_mm=e0, eye1_mm=e1, mean_mm=mean_mm)
-        # Free the per-sample buffers — they're not needed after finalization.
         self._samples_eye0.clear()
         self._samples_eye1.clear()
         return True
+
+    # ---- introspection -------------------------------------------------- #
 
     def is_ready(self) -> bool:
         return self._baseline is not None and not math.isnan(self._baseline.mean_mm)
@@ -112,15 +219,28 @@ class BaselineTracker:
         return self._baseline
 
     def started_at(self) -> Optional[float]:
-        return self._started_at
+        """Whichever start marker is active (explicit takes precedence)."""
+        if self._explicit_mode:
+            return self._calibration_started_at
+        return self._auto_started_at
 
     def seconds_remaining(self, latest_t: Optional[float]) -> Optional[float]:
         if self._baseline is not None:
             return 0.0
-        if self._started_at is None or latest_t is None:
+        start = self.started_at()
+        if start is None or latest_t is None:
             return None
-        remain = self._baseline_duration_s - (latest_t - self._started_at)
+        remain = self._baseline_duration_s - (latest_t - start)
         return max(0.0, remain)
+
+    def mode(self) -> str:
+        """Reporting helper: 'calibration_phase' if explicit Mode A is in use,
+        'auto' if implicit Mode B, '' if no samples have arrived yet."""
+        if self._explicit_mode:
+            return "calibration_phase"
+        if self._auto_started_at is not None:
+            return "auto"
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -144,6 +264,8 @@ class SessionState:
 
     session_started_at: Optional[float] = None
     step_changed_at: Optional[float] = None
+    calibration_started_at: Optional[float] = None
+    calibration_ended_at: Optional[float] = None
     latest_pupil_t: Optional[float] = None
     latest_prediction_at_wall: Optional[float] = None
     last_seen_wall: float = field(default_factory=time.time)
@@ -223,6 +345,25 @@ class SessionState:
         self.step_id = None
         self.step_changed_at = None
 
+    def mark_calibration_start(self) -> None:
+        """Frontend signal: calibration phase has begun. Baseline accumulator
+        gets reset and will accept samples until calibration_end is received."""
+        self.baseline.mark_calibration_start(self.latest_pupil_t)
+        self.calibration_started_at = self.latest_pupil_t
+
+    def mark_calibration_end(self) -> bool:
+        """Frontend signal: calibration phase has ended. Freezes the baseline.
+        Returns True if a baseline was successfully frozen, False if not
+        enough samples were collected."""
+        ok = self.baseline.mark_calibration_end(self.latest_pupil_t)
+        self.calibration_ended_at = self.latest_pupil_t
+        # Anchor session_started_at to the moment calibration ended — the
+        # procedure timer starts here, so step-1 windows have a full clean
+        # pre-history (the baseline period).
+        if self.session_started_at is None:
+            self.session_started_at = self.latest_pupil_t
+        return ok
+
     def mark_step_change(self, step_number: int, step_id: Optional[int]) -> None:
         self.step_number = step_number
         self.step_id = step_id
@@ -295,6 +436,10 @@ class SessionState:
             "step_number": self.step_number,
             "participant_id": self.participant_id,
             "session_started_at": self.session_started_at,
+            "calibration_started_at": self.calibration_started_at,
+            "calibration_ended_at": self.calibration_ended_at,
+            "calibrating": self.baseline.calibrating(),
+            "baseline_mode": self.baseline.mode(),
             "latest_pupil_t": self.latest_pupil_t,
             "latest_prediction_at": self.latest_prediction_at_wall,
             "pupil_samples_buffered": len(self._pupil),
@@ -306,6 +451,7 @@ class SessionState:
                 if bl is not None
                 else None
             ),
+            "baseline_seconds_remaining": self.baseline.seconds_remaining(self.latest_pupil_t),
             "last_prediction": self.last_prediction,
         }
 

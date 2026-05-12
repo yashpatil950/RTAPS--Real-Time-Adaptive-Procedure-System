@@ -42,6 +42,8 @@ from app.inference_loop import InferenceLoop
 from app.predictor import LocalPredictor
 from app.schemas import (
     BlinkIngestRequest,
+    CalibrationEndRequest,
+    CalibrationStartRequest,
     FixationIngestRequest,
     HealthResponse,
     IngestResponse,
@@ -222,6 +224,51 @@ async def session_start(req: SessionStartRequest) -> SessionAck:
     )
 
 
+@app.post("/session/calibration_start", response_model=SessionAck)
+async def session_calibration_start(req: CalibrationStartRequest) -> SessionAck:
+    """Operator is sitting calmly at the fixation cross. Begin baseline
+    accumulation. Predictions remain suppressed until calibration_end."""
+    st = await app.state.registry.get_or_create(req.stream_id)
+    async with st.lock:
+        st.mark_calibration_start()
+    return SessionAck(
+        stream_id=req.stream_id,
+        status="calibration_started",
+        message=(
+            f"Calibration in progress. Pupil samples are being accumulated. "
+            f"Target duration: {settings.baseline_duration_s:.0f}s. "
+            f"POST /session/calibration_end when the calibration screen completes."
+        ),
+    )
+
+
+@app.post("/session/calibration_end", response_model=SessionAck)
+async def session_calibration_end(req: CalibrationEndRequest) -> SessionAck:
+    """Freeze the baseline using whatever samples were collected during
+    calibration. After this, the procedure may begin and predictions are
+    enabled from step 1 second 0."""
+    st = app.state.registry.get(req.stream_id)
+    if st is None:
+        raise HTTPException(404, f"No active session for stream_id={req.stream_id}")
+    async with st.lock:
+        ok = st.mark_calibration_end()
+    if not ok:
+        return SessionAck(
+            stream_id=req.stream_id,
+            status="calibration_insufficient_samples",
+            message=(
+                "Calibration ended but no usable pupil samples were collected. "
+                "Check that the Pupil Capture bridge was running and the operator's "
+                "eyes were tracked. Restart the calibration period."
+            ),
+        )
+    return SessionAck(
+        stream_id=req.stream_id,
+        status="calibration_completed",
+        message="Baseline frozen. Procedure may now begin — predictions enabled from step 1.",
+    )
+
+
 @app.post("/session/step_change", response_model=SessionAck)
 async def session_step_change(req: StepChangeRequest) -> SessionAck:
     st = app.state.registry.get(req.stream_id)
@@ -322,6 +369,11 @@ async def session_state(stream_id: str) -> SessionStateView:
         step_number=view["step_number"],
         participant_id=view["participant_id"],
         session_started_at=view["session_started_at"],
+        calibration_started_at=view.get("calibration_started_at"),
+        calibration_ended_at=view.get("calibration_ended_at"),
+        calibrating=bool(view.get("calibrating", False)),
+        baseline_mode=view.get("baseline_mode", "") or "",
+        baseline_seconds_remaining=view.get("baseline_seconds_remaining"),
         latest_pupil_t=view["latest_pupil_t"],
         latest_prediction_at=view["latest_prediction_at"],
         pupil_samples_buffered=view["pupil_samples_buffered"],
