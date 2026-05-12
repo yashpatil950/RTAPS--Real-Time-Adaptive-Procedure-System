@@ -70,6 +70,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 async def lifespan(app: FastAPI):
     registry = SessionRegistry(
         window_len_s=settings.window_len_s,
+        fixation_window_len_s=settings.fixation_window_len_s,
+        blink_window_len_s=settings.blink_window_len_s,
         baseline_duration_s=settings.baseline_duration_s,
         min_confidence=settings.min_confidence,
         blink_tracking_loss_s=settings.blink_tracking_loss_s,

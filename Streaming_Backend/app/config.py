@@ -37,7 +37,11 @@ class Settings:
     port: int = _env_int("PORT", 8000)
 
     # ---- Feature/window contract (must match training pipeline) ----------
-    window_len_s: float = _env_float("WINDOW_LEN_S", 10.0)
+    # Per-feature windows — match ML Algorithm/scripts/lib/config.py
+    # (WINDOW_LEN_S_PUPIL / FIXATION / BLINK).
+    window_len_s: float = _env_float("WINDOW_LEN_S", 10.0)              # pupil
+    fixation_window_len_s: float = _env_float("FIXATION_WINDOW_LEN_S", 30.0)
+    blink_window_len_s: float = _env_float("BLINK_WINDOW_LEN_S", 30.0)
     stride_s: float = _env_float("STRIDE_S", 1.0)
     baseline_duration_s: float = _env_float("BASELINE_DURATION_S", 120.0)
     min_confidence: float = _env_float("MIN_CONFIDENCE", 0.6)

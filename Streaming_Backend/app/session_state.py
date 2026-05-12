@@ -251,7 +251,15 @@ class BaselineTracker:
 @dataclass
 class SessionState:
     stream_id: str
+    # Per-feature window lengths. `window_len_s` is the PUPIL window
+    # (the "primary" decision window — used for PCPS, data yield, etc.).
+    # `fixation_window_len_s` and `blink_window_len_s` are typically longer
+    # (30 s in v4) because fixation/blink events are sparse and need more
+    # history for stable estimates. Trim cutoffs are applied per-buffer so
+    # data isn't dropped too early.
     window_len_s: float
+    fixation_window_len_s: float
+    blink_window_len_s: float
     baseline_duration_s: float
     min_confidence: float
     blink_tracking_loss_s: float
@@ -318,15 +326,28 @@ class SessionState:
         return len(fixations)
 
     def _trim(self) -> None:
-        """Drop anything that left the window relative to the latest pupil_t."""
+        """Drop anything that left ITS OWN window relative to the latest pupil_t.
+
+        v4 uses different windows per feature group:
+          pupil    → 10 s
+          fixation → 30 s
+          blink    → 30 s
+
+        Using a single 10 s cutoff would discard fixations and blinks that
+        are still inside their (longer) windows — sparse events would then
+        present as NaN feature values in the UI, which is what `the fixation
+        data is blank in the UI` was reporting.
+        """
         if self.latest_pupil_t is None:
             return
-        cutoff = self.latest_pupil_t - self.window_len_s
-        while self._pupil and self._pupil[0].t < cutoff:
+        pupil_cutoff = self.latest_pupil_t - self.window_len_s
+        blink_cutoff = self.latest_pupil_t - self.blink_window_len_s
+        fix_cutoff = self.latest_pupil_t - self.fixation_window_len_s
+        while self._pupil and self._pupil[0].t < pupil_cutoff:
             self._pupil.popleft()
-        while self._blinks and self._blinks[0].t < cutoff:
+        while self._blinks and self._blinks[0].t < blink_cutoff:
             self._blinks.popleft()
-        while self._fixations and self._fixations[0].t < cutoff:
+        while self._fixations and self._fixations[0].t < fix_cutoff:
             self._fixations.popleft()
 
     # ---- ui state ------------------------------------------------------- #
@@ -523,12 +544,16 @@ class SessionRegistry:
         self,
         *,
         window_len_s: float,
+        fixation_window_len_s: float,
+        blink_window_len_s: float,
         baseline_duration_s: float,
         min_confidence: float,
         blink_tracking_loss_s: float,
         idle_ttl_s: float,
     ):
         self._window_len_s = window_len_s
+        self._fixation_window_len_s = fixation_window_len_s
+        self._blink_window_len_s = blink_window_len_s
         self._baseline_duration_s = baseline_duration_s
         self._min_confidence = min_confidence
         self._blink_tracking_loss_s = blink_tracking_loss_s
@@ -543,6 +568,8 @@ class SessionRegistry:
                 st = SessionState(
                     stream_id=stream_id,
                     window_len_s=self._window_len_s,
+                    fixation_window_len_s=self._fixation_window_len_s,
+                    blink_window_len_s=self._blink_window_len_s,
                     baseline_duration_s=self._baseline_duration_s,
                     min_confidence=self._min_confidence,
                     blink_tracking_loss_s=self._blink_tracking_loss_s,
