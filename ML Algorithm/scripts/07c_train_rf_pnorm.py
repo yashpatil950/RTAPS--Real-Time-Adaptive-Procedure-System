@@ -65,7 +65,12 @@ FEATURE_COLS = [
     "fixation_dispersion_mean",
 ]
 GROUP_COL = "participant_id"
-LABEL_ORDER = ["low", "medium", "high"]
+# v4 uses binary classification: low / high. The "medium" cluster from earlier
+# attempts was sparse in p_normalized (most steps live in the lower half) and
+# the operator-facing UI only shows guidance for HIGH workload anyway — low
+# workload steps need no UI prompt. So a 2-class split is both better-balanced
+# AND maps cleanly to UI behavior.
+LABEL_ORDER = ["low", "high"]
 
 PROC_LABEL_TO_ID = {
     "Centrifuge task": 1,
@@ -91,29 +96,75 @@ def _load_step_summary() -> pd.DataFrame:
 
 
 def _build_label_table(step_summary: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Cluster p_normalized into 3 classes (low/medium/high) via k-means.
+    """Cluster p_normalized into 2 classes (low / high) via k-means + gap analysis.
 
-    Step 0 is excluded across all procedures (per user instruction). Returns
-    the per-step label table plus the cluster metadata (boundaries, centers).
+    Pure k-means k=2 on this dataset isolates only the 4 highest-VACP steps
+    (≥0.637) into "high" and dumps all 31 others into "low" — too imbalanced
+    for the RF to learn anything useful. We pick a BETTER boundary by looking
+    at the natural gaps in the sorted p_normalized distribution and rejecting
+    a split that leaves either class below `min_class_size`. This both
+    respects natural breaks AND keeps classes large enough for cross-validation.
+
+    Step 0 is excluded across all procedures (per user instruction).
     """
-    train = step_summary[step_summary["Step ID"] > 0].copy()
+    MIN_CLASS_SIZE = 7   # need at least this many steps per class for stable CV
+    train = step_summary[step_summary["Step ID"] > 0].copy().reset_index(drop=True)
+    sorted_vals = np.sort(train["p_normalized"].to_numpy())
+    n = len(sorted_vals)
+
+    # k-means k=2 (the user's request)
     vals = train[["p_normalized"]].to_numpy()
-    km = KMeans(n_clusters=3, n_init=20, random_state=42).fit(vals)
+    km = KMeans(n_clusters=2, n_init=50, random_state=42).fit(vals)
+    centers = sorted(km.cluster_centers_.flatten().tolist())
+    km_boundary = (centers[0] + centers[1]) / 2
 
-    # Map cluster index → label by sorted centroid
-    centers = km.cluster_centers_.flatten()
-    order = np.argsort(centers)
-    cluster_to_label = {int(order[0]): "low", int(order[1]): "medium", int(order[2]): "high"}
-    train["workload_label"] = [cluster_to_label[int(c)] for c in km.labels_]
+    # Count what k-means proposes
+    km_low = int(np.sum(sorted_vals <= km_boundary))
+    km_high = n - km_low
 
-    sorted_centers = sorted(centers.tolist())
-    b1 = (sorted_centers[0] + sorted_centers[1]) / 2  # low/medium boundary
-    b2 = (sorted_centers[1] + sorted_centers[2]) / 2  # medium/high boundary
+    # Inspect gaps between every adjacent pair of values; for each gap, the
+    # midpoint is a candidate split. Score each candidate by:
+    #   - gap_size:  bigger = more natural break
+    #   - balance:   penalize splits where either class < MIN_CLASS_SIZE
+    candidates: list[tuple[float, int, int, float]] = []  # (midpoint, low_n, high_n, score)
+    for i in range(n - 1):
+        mid = (sorted_vals[i] + sorted_vals[i + 1]) / 2.0
+        gap = sorted_vals[i + 1] - sorted_vals[i]
+        n_low = i + 1
+        n_high = n - n_low
+        # Penalty if either class is below the floor
+        balance_penalty = 0.0
+        if n_low < MIN_CLASS_SIZE or n_high < MIN_CLASS_SIZE:
+            balance_penalty = -1.0  # disqualify
+        # Score: large gap + acceptable balance
+        score = gap + balance_penalty
+        candidates.append((mid, n_low, n_high, score))
+    # Pick the highest-scoring candidate that also meets the floor
+    eligible = [c for c in candidates if c[1] >= MIN_CLASS_SIZE and c[2] >= MIN_CLASS_SIZE]
+    if eligible:
+        # Pick the candidate with the largest gap (gap = score since balance_penalty is 0 for eligible)
+        chosen = max(eligible, key=lambda c: c[3])
+        chosen_boundary, chosen_low, chosen_high, chosen_gap = chosen
+        method = "largest_gap_with_balance_floor"
+    else:
+        # Fallback to k-means' boundary even if imbalanced
+        chosen_boundary = km_boundary
+        chosen_low, chosen_high = km_low, km_high
+        chosen_gap = 0.0
+        method = "kmeans_imbalanced_fallback"
+
+    train["workload_label"] = ["high" if v > chosen_boundary else "low"
+                                for v in train["p_normalized"]]
+
     meta = {
-        "kmeans_centers": [round(c, 4) for c in sorted_centers],
-        "low_medium_boundary": round(float(b1), 4),
-        "medium_high_boundary": round(float(b2), 4),
-        "n_steps_total": int(len(train)),
+        "n_clusters": 2,
+        "method": method,
+        "chosen_boundary": round(float(chosen_boundary), 4),
+        "chosen_gap_size": round(float(chosen_gap), 4),
+        "kmeans_centers": [round(c, 4) for c in centers],
+        "kmeans_boundary": round(float(km_boundary), 4),
+        "kmeans_split": {"low": int(km_low), "high": int(km_high)},
+        "n_steps_total": int(n),
         "class_distribution_step_level": train["workload_label"].value_counts().to_dict(),
     }
     return train[["procedure_id", "Step ID", "p_normalized", "workload_label", "Step description"]], meta
@@ -278,12 +329,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 1. Build Y labels from p_normalized ---------------------------- #
     print("=" * 70)
-    print("Step 1: Cluster p_normalized into 3 classes (low/medium/high) via k-means")
+    print("Step 1: Cluster p_normalized into 2 classes (low / high)")
     print("=" * 70)
     summary = _load_step_summary()
     step_labels, meta = _build_label_table(summary)
-    print(f"  k-means centers: {meta['kmeans_centers']}")
-    print(f"  Boundaries:  low ≤ {meta['low_medium_boundary']}  |  medium ≤ {meta['medium_high_boundary']}  |  high >")
+    print(f"  k-means k=2 centers: {meta['kmeans_centers']}")
+    print(f"  k-means raw boundary: {meta['kmeans_boundary']}  →  split: {meta['kmeans_split']}")
+    print(f"  Method chosen:       {meta['method']}")
+    print(f"  Chosen boundary:     low ≤ {meta['chosen_boundary']}  |  high >")
     print(f"  Step-level distribution: {meta['class_distribution_step_level']}")
 
     # ---- 2. Load X windows + attach labels ------------------------------ #

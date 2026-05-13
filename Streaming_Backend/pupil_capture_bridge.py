@@ -210,8 +210,15 @@ def _handle_fixation(ctx: BridgeContext, payload: dict[str, Any]) -> None:
         nx, ny = float(nx), float(ny)
 
     dur_raw = float(payload.get("duration", 0.0))
-    # Pupil reports fixation duration in milliseconds (see Pupil Network API docs).
-    dur_s = dur_raw / 1000.0
+    # Pupil Capture's Online Fixation Detector publishes duration in
+    # milliseconds. Typical human fixation durations are 100-500 ms; some
+    # third-party plugins emit seconds (0.1-0.5). Use a heuristic so both
+    # forms produce a correct seconds value:
+    #   - duration > 50  → assume milliseconds (divide by 1000)
+    #   - duration ≤ 50  → assume already in seconds (no division)
+    # A 50 ms fixation is below the perceptual threshold; a 50 s fixation
+    # is biophysically impossible.
+    dur_s = dur_raw / 1000.0 if dur_raw > 50.0 else dur_raw
 
     disp_raw = payload.get("dispersion")
     try:
@@ -275,6 +282,24 @@ def main() -> int:
     poller.register(sub, zmq.POLLIN)
 
     log.info("Forwarding to %s with stream_id=%s", args.backend_url, args.stream_id)
+    log.info("Subscribed prefixes: pupil. / blink / fixation / notify.")
+    log.info("NOTE: For fixation features to populate, you MUST enable the")
+    log.info("      Online Fixation Detector plugin in Pupil Capture")
+    log.info("      (Plugin Manager → Online Fixation Detector). Similarly for")
+    log.info("      Online Blink Detector. Without these, no events arrive.")
+
+    # Diagnostic counters — log a one-shot INFO message when the FIRST event
+    # of each kind arrives. Then a periodic summary every 30 s.
+    counts = {"pupil": 0, "blink": 0, "fixation": 0, "notify": 0, "other": 0}
+    first_seen: dict[str, bool] = {"pupil": False, "blink": False, "fixation": False}
+    last_summary = time.monotonic()
+
+    def _record_and_log(kind: str) -> None:
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind in first_seen and not first_seen[kind]:
+            first_seen[kind] = True
+            log.info("✓ First %s event received from Pupil Capture.", kind)
+
     try:
         while True:
             socks = dict(poller.poll(timeout=50))
@@ -309,21 +334,54 @@ def main() -> int:
                 # Prefer payload["topic"] for fixation datums — envelope string can differ by Pupil version.
                 fixation_inner = inner_topic in ("fixation", "fixations")
                 if topic_str.startswith("pupil"):
+                    _record_and_log("pupil")
                     batcher.add(payload)
                 elif fixation_inner:
+                    _record_and_log("fixation")
                     _handle_fixation(ctx, payload)
                 elif topic_str.startswith("blink"):
+                    _record_and_log("blink")
                     _handle_blink(ctx, payload)
                 elif topic_str.startswith("fixation"):
+                    _record_and_log("fixation")
                     _handle_fixation(ctx, payload)
                 elif topic_str.startswith("notify."):
                     # Notifications use envelope ``notify.<subject>``; some builds encode fixation-like datums here.
                     subj = payload.get("subject")
                     if isinstance(subj, str) and "fixation" in subj.lower() and payload.get("start_timestamp") is not None:
+                        _record_and_log("fixation")
                         _handle_fixation(ctx, payload)
+                    else:
+                        counts["notify"] += 1
+                else:
+                    counts["other"] += 1
             batcher.maybe_flush()
+
+            # Periodic counter summary (every 30 s) so the operator can see
+            # at a glance whether fixations are arriving.
+            now = time.monotonic()
+            if now - last_summary >= 30.0:
+                last_summary = now
+                log.info(
+                    "Bridge counters (last 30 s+): pupil=%d  blink=%d  fixation=%d  notify=%d  other=%d",
+                    counts.get("pupil", 0),
+                    counts.get("blink", 0),
+                    counts.get("fixation", 0),
+                    counts.get("notify", 0),
+                    counts.get("other", 0),
+                )
+                if counts.get("fixation", 0) == 0:
+                    log.warning(
+                        "No fixations received yet. Check Pupil Capture → Plugin Manager "
+                        "→ Online Fixation Detector is enabled."
+                    )
+                if counts.get("blink", 0) == 0:
+                    log.warning(
+                        "No blinks received yet. Check Pupil Capture → Plugin Manager "
+                        "→ Online Blink Detector is enabled."
+                    )
     except KeyboardInterrupt:
-        log.info("Interrupted; exiting.")
+        log.info("Interrupted; exiting. Final counts: %s", counts)
     finally:
         batcher.maybe_flush()
         sub.close()

@@ -497,16 +497,29 @@ export default function StreamingDashboard() {
               <div className="bg-slate-50 rounded-lg py-2 border border-slate-100">
                 <div className="text-[10px] uppercase text-slate-500">Pupil samples</div>
                 <div className="text-xl font-bold tabular-nums text-slate-800">{dash?.pupil_samples_buffered ?? '—'}</div>
+                <div className="text-[9px] text-slate-400">total {dash?.pupil_received_total ?? '—'}</div>
               </div>
               <div className="bg-slate-50 rounded-lg py-2 border border-slate-100">
                 <div className="text-[10px] uppercase text-slate-500">Blinks</div>
                 <div className="text-xl font-bold tabular-nums text-slate-800">{dash?.blinks_buffered ?? '—'}</div>
+                <div className="text-[9px] text-slate-400">total {dash?.blinks_received_total ?? '—'}</div>
               </div>
               <div className="bg-slate-50 rounded-lg py-2 border border-slate-100">
                 <div className="text-[10px] uppercase text-slate-500">Fixations</div>
                 <div className="text-xl font-bold tabular-nums text-slate-800">{dash?.fixations_buffered ?? '—'}</div>
+                <div className="text-[9px] text-slate-400">total {dash?.fixations_received_total ?? '—'}</div>
               </div>
             </div>
+
+            {/* Fixation-received warning — appears if no fixations have been
+                received yet, helping the operator catch a disabled Pupil Capture
+                plugin or a stopped bridge. */}
+            {dash && dash.pupil_received_total > 0 && (dash.fixations_received_total ?? 0) === 0 && (
+              <div className="mt-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                ⚠ No fixations received yet (pupil samples are flowing).
+                Check <strong>Pupil Capture → Plugin Manager → Online Fixation Detector</strong> is enabled.
+              </div>
+            )}
 
             <div className="h-[200px] w-full grid grid-cols-1 gap-2">
               <div className="h-[94px] min-h-[94px]">

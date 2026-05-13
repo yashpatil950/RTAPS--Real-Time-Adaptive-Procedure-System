@@ -280,10 +280,20 @@ class SessionState:
 
     last_prediction: Optional[dict] = None  # serialized PredictionResponse
 
-    # Plain Python deques sized to ~ generous worst-case for a 10 s window.
+    # Running totals — never trimmed. Useful for diagnosing "are fixations
+    # even reaching the backend?" when the rolling buffer is empty (sparse
+    # events get trimmed past the 30 s window).
+    pupil_received_total: int = 0
+    blinks_received_total: int = 0
+    fixations_received_total: int = 0
+    last_fixation_received_at: Optional[float] = None  # wall clock
+    last_blink_received_at: Optional[float] = None     # wall clock
+
+    # Plain Python deques sized to ~ generous worst-case for the longest
+    # per-feature window (blink/fixation = 30 s).
     _pupil: Deque[_PupilRec] = field(default_factory=lambda: deque(maxlen=4000))
-    _blinks: Deque[_BlinkRec] = field(default_factory=lambda: deque(maxlen=200))
-    _fixations: Deque[_FixRec] = field(default_factory=lambda: deque(maxlen=400))
+    _blinks: Deque[_BlinkRec] = field(default_factory=lambda: deque(maxlen=400))
+    _fixations: Deque[_FixRec] = field(default_factory=lambda: deque(maxlen=800))
 
     baseline: BaselineTracker = field(init=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -302,6 +312,7 @@ class SessionState:
             self.baseline.add(s)
             self.latest_pupil_t = s.t if self.latest_pupil_t is None else max(self.latest_pupil_t, s.t)
             accepted += 1
+        self.pupil_received_total += accepted
         if self.latest_pupil_t is not None:
             self.baseline.maybe_finalize(self.latest_pupil_t)
             self._trim()
@@ -314,6 +325,9 @@ class SessionState:
             b.tracking_loss = b.tracking_loss or (b.duration >= self.blink_tracking_loss_s)
             self._blinks.append(b)
             accepted += 1
+        self.blinks_received_total += accepted
+        if accepted:
+            self.last_blink_received_at = time.time()
         self._trim()
         self.last_seen_wall = time.time()
         return accepted
@@ -321,9 +335,13 @@ class SessionState:
     def add_fixations(self, fixations: list[_FixRec]) -> int:
         for f in fixations:
             self._fixations.append(f)
+        n = len(fixations)
+        self.fixations_received_total += n
+        if n:
+            self.last_fixation_received_at = time.time()
         self._trim()
         self.last_seen_wall = time.time()
-        return len(fixations)
+        return n
 
     def _trim(self) -> None:
         """Drop anything that left ITS OWN window relative to the latest pupil_t.
@@ -466,6 +484,16 @@ class SessionState:
             "pupil_samples_buffered": len(self._pupil),
             "blinks_buffered": len(self._blinks),
             "fixations_buffered": len(self._fixations),
+            # Running totals — survive deque trimming. Use these to verify
+            # that fixations/blinks are reaching the backend at all (a buffer
+            # of 0 could just mean "no recent events", but a TOTAL of 0 after
+            # many seconds means the bridge / Online Fixation Detector plugin
+            # isn't sending anything).
+            "pupil_received_total": self.pupil_received_total,
+            "blinks_received_total": self.blinks_received_total,
+            "fixations_received_total": self.fixations_received_total,
+            "last_blink_received_at": self.last_blink_received_at,
+            "last_fixation_received_at": self.last_fixation_received_at,
             "baseline_ready": self.baseline.is_ready(),
             "baseline": (
                 {"eye0_mm": bl.eye0_mm, "eye1_mm": bl.eye1_mm, "mean_mm": bl.mean_mm}

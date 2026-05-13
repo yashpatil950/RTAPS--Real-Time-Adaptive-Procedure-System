@@ -158,6 +158,12 @@ class SessionStateView(BaseModel):
     pupil_samples_buffered: int
     blinks_buffered: int
     fixations_buffered: int
+    # Running totals (never trimmed) — diagnose "is the bridge sending anything?"
+    pupil_received_total: int = 0
+    blinks_received_total: int = 0
+    fixations_received_total: int = 0
+    last_blink_received_at: float | None = None
+    last_fixation_received_at: float | None = None
     baseline_ready: bool
     baseline: dict[str, float] | None
     last_prediction: PredictionResponse | None
