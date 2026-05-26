@@ -66,6 +66,10 @@ const SessionView = () => {
     } catch (_) { return false; }
   });
   const [blockedHintSteps, setBlockedHintSteps] = useState(new Set());
+  // devExtraSeconds is still added into the session-timer math so the legacy
+  // "+10s (dev)" mechanism doesn't break for anyone still using it programmatically.
+  // The setter is unused now that the +10s button was removed from the UI.
+  // eslint-disable-next-line no-unused-vars
   const [devExtraSeconds, setDevExtraSeconds] = useState(0);
   const [devExtraAtEnd, setDevExtraAtEnd] = useState(0);
   
@@ -492,7 +496,8 @@ const SessionView = () => {
           {(() => {
             const firstIncompleteIndex = procedure.steps.findIndex(s => !completedSteps.has(s.id));
             return procedure.steps.map((step, index) => {
-              const timeSpent = stepTimes[step.id] || 0;
+              // (timeSpent was previously surfaced in the per-step right column
+              // — that whole panel was removed to declutter the operator screen.)
               const isCompleted = completedSteps.has(step.id);
               const isActiveStep = !isCompleted && (firstIncompleteIndex === -1 ? false : index === firstIncompleteIndex);
               const isDisabled = !isCompleted && !isActiveStep;
@@ -538,71 +543,12 @@ const SessionView = () => {
                     </div>
                   </div>
                   
-                  <div className="text-right">
-                    {/* Clean interface - no technical details shown to operator.
-                        Dev mode surfaces the real ML workload state. */}
-                    {devMode && (
-                      <div className="text-xs text-gray-500 text-right">
-                        {!useWorkloadFeedback && <div>Target: {step.timeThreshold}s</div>}
-                        {useWorkloadFeedback && (() => {
-                          const wl = stepWorkloadStates[step.id];
-                          if (!wl) {
-                            return (
-                              <div>
-                                Workload: <span className="font-mono">— (waiting for stream)</span>
-                              </div>
-                            );
-                          }
-                          const proba = wl.proba || {};
-                          return (
-                            <div>
-                              <div>
-                                Current: <span className="font-semibold uppercase">{wl.current}</span>
-                                {' · '}
-                                Highest: <span className="font-semibold uppercase">{wl.highest}</span>
-                                {wl.rawLabel && wl.rawLabel !== wl.current ? (
-                                  <span className="ml-1 text-gray-400">(raw: {wl.rawLabel})</span>
-                                ) : null}
-                              </div>
-                              <div className="font-mono">
-                                low {((proba.low || 0) * 100).toFixed(0)}% · med {((proba.medium || 0) * 100).toFixed(0)}% · high {((proba.high || 0) * 100).toFixed(0)}%
-                              </div>
-                            </div>
-                          );
-                        })()}
-                        <div className="mt-1 flex items-center justify-end space-x-2">
-                          <span className="text-gray-500">{isActiveStep ? `Time on this step: ${formatTime(timeSpent)}` : ''}</span>
-                          {isActiveStep && !useWorkloadFeedback && (
-                            <button
-                              onClick={() => {
-                                // Add +10s to active step by shifting its start time back 10s
-                                setStepStartTimes(prev => {
-                                  const currentStart = prev[step.id] || new Date();
-                                  const shifted = new Date(currentStart.getTime() - 10000);
-                                  return { ...prev, [step.id]: shifted };
-                                });
-                                // Immediately reflect UI and sub-step state
-                                setStepTimes(prev => {
-                                  const current = prev[step.id] || 0;
-                                  const next = current + 10;
-                                  const newTimes = { ...prev, [step.id]: next };
-                                  if (next >= step.timeThreshold && !expandedSteps.has(step.id)) {
-                                    setExpandedSteps(prevExp => new Set([...prevExp, step.id]));
-                                  }
-                                  return newTimes;
-                                });
-                                // Update session timer in dev mode so total reflects additions
-                                setDevExtraSeconds(prev => prev + 10);
-                              }}
-                              className="px-2 py-1 bg-gray-100 hover:bg-gray-200 rounded border text-gray-700"
-                            >
-                              +10s (dev)
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
+                  {/* Removed: the per-step workload metrics panel (Current/
+                      Highest/probabilities/time-on-step) that used to sit
+                      in the upper-right of each step card. Operators don't
+                      need to see those details — they're a distraction.
+                      Trainers and admins can still inspect them on the
+                      Live ML dashboard (/streaming). */}
                 </div>
                 
                 {step.instructions && step.instructions.trim() !== '' && (
