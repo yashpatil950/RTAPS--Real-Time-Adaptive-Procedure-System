@@ -97,7 +97,7 @@ class Settings:
     # ---- Model -----------------------------------------------------------
     model_path: Path = _env_path(
         "MODEL_PATH",
-        str(Path(__file__).resolve().parents[2] / "ML Algorithm" / "models" / "v4_rf_pnorm.joblib"),
+        str(Path(__file__).resolve().parents[2] / "ML Algorithm" / "models" / "v5_rf_tuned.joblib"),
     )
 
     # ---- Optional remote inference (forward features, get back prediction)
