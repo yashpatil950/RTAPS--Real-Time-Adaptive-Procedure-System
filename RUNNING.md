@@ -84,10 +84,26 @@ For each step in the procedure:
 model has shown medium for a step, it never disappears even if the level
 later goes higher.
 
-The 30-second `WorkloadSmoother` prevents jittery instruction changes —
-the on-screen level only updates when the model's new label has held for
-30 consecutive seconds, and direction-guarded (e.g., `low → high` must
-pass through `medium` first).
+The `WorkloadSmoother` prevents jittery instruction changes — the
+on-screen level only updates when the model's new label has held for
+`WORKLOAD_SMOOTHER_STABILITY_S` consecutive seconds (default **3 s**),
+and the transition is direction-guarded (e.g., `low → high` must pass
+through `medium` first). Tune the gate at backend start time via the env
+var, e.g. `WORKLOAD_SMOOTHER_STABILITY_S=5`.
+
+### Feature sanitization
+
+Three live features routinely run outside the model's training envelope
+(blink_rate_30s, fixation_dur_mean_ms, fixation_dispersion_mean — the
+live detectors fire more events than the offline Pupil-player exports
+used for training). The backend handles this via
+`FEATURE_SANITIZE_STRATEGY`:
+
+| Strategy | Behavior | Use when |
+|---|---|---|
+| `clip` (default) | Clamp out-of-distribution values to the [1st-%ile, 99th-%ile] training envelope; preserves directional signal | Normal operation |
+| `mask` | Replace OOD values with NaN; the model's SimpleImputer fills with class-neutral training medians | A sensor channel is producing nonsense and you want it ignored |
+| `off` | Pass values through unchanged | Diagnostics only — the RF will extrapolate |
 
 ## 5. Without the eye tracker (UI-only test)
 
@@ -107,13 +123,13 @@ the Low/Medium/High buttons.
 | FastAPI app | `Streaming_Backend/app/main.py` |
 | Per-session state + baseline tracker | `Streaming_Backend/app/session_state.py` |
 | Inference loop (1 s tick) | `Streaming_Backend/app/inference_loop.py` |
-| Workload smoother (30 s gate + direction guard) | `Streaming_Backend/app/workload_smoother.py` |
+| Workload smoother (3 s gate + direction guard, configurable) | `Streaming_Backend/app/workload_smoother.py` |
 | Local model wrapper | `Streaming_Backend/app/predictor.py` |
 | Pupil Capture bridge | `Streaming_Backend/pupil_capture_bridge.py` |
 | Frontend session page (the live UI) | `RTAPS_Frontend/src/pages/SessionView.js` |
 | Frontend streaming API client | `RTAPS_Frontend/src/services/streamingApi.js` |
 | Per-step instructions (medium/high feedback) | `RTAPS_Frontend/src/data/stepFeedback.js` |
-| ML model artifact | `ML Algorithm/models/v2_hgb_vacp.joblib` |
+| ML model artifact | `ML Algorithm/models/v4_rf_pnorm.joblib` |
 
 ## 7. Troubleshooting
 

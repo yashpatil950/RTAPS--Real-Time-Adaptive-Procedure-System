@@ -109,16 +109,23 @@ class BaselineTracker:
 
     def mark_calibration_start(self, t: Optional[float]) -> None:
         """Frontend signal: calibration phase has begun. Future pupil samples
-        will be accumulated as baseline data."""
-        if self._baseline is not None:
-            return  # already finalized; ignore late starts
+        will be accumulated as baseline data.
+
+        The operator's deliberate "sit still and look at the cross" baseline
+        is the authoritative one — it always supersedes any Mode B baseline
+        that may have already auto-finalized while the bridge was streaming
+        but the frontend hadn't yet started the session. So this resets:
+          * the previously-finalized baseline (if any),
+          * any partial Mode B accumulation,
+          * the accumulators themselves.
+        """
         self._explicit_mode = True
         # If `t` is None we don't know the pupil clock yet — the first
         # incoming pupil sample will anchor `_calibration_started_at`.
         self._calibration_started_at = t
-        # Reset any partial Mode B accumulation if we had one — explicit
-        # calibration takes precedence.
+        self._calibration_ended_at = None
         self._auto_started_at = None
+        self._baseline = None
         self._samples_eye0.clear()
         self._samples_eye1.clear()
 
@@ -127,9 +134,12 @@ class BaselineTracker:
         baseline using whatever samples are in the accumulator. Returns
         True if a baseline was successfully frozen.
         """
-        if self._baseline is not None:
-            return False
         self._calibration_ended_at = t
+        # Defensive: if for some reason a baseline already exists (e.g. a
+        # late-arriving auto-finalize from before calibration_start cleared
+        # state), treat that as success rather than rejecting the calibration.
+        if self._baseline is not None:
+            return True
         return self._finalize_now()
 
     def calibrating(self) -> bool:
@@ -242,6 +252,17 @@ class BaselineTracker:
             return "auto"
         return ""
 
+    def accumulator_counts(self) -> tuple[int, int]:
+        """How many baseline-accumulator samples currently held for each eye.
+        Used by the calibration_end diagnostic to distinguish 'no samples
+        ever arrived' from 'samples arrived but were dropped by Mode B
+        because baseline was already finalized'."""
+        return len(self._samples_eye0), len(self._samples_eye1)
+
+    def explicit_active(self) -> bool:
+        """True iff calibration_start has put the tracker into Mode A."""
+        return self._explicit_mode
+
 
 # --------------------------------------------------------------------------- #
 # Per-stream live state                                                       #
@@ -293,7 +314,22 @@ class SessionState:
     # per-feature window (blink/fixation = 30 s).
     _pupil: Deque[_PupilRec] = field(default_factory=lambda: deque(maxlen=4000))
     _blinks: Deque[_BlinkRec] = field(default_factory=lambda: deque(maxlen=400))
-    _fixations: Deque[_FixRec] = field(default_factory=lambda: deque(maxlen=800))
+    # NOTE: fixations are stored in an insertion-ordered dict keyed by
+    # `start_timestamp` (the fixation's onset, which is unique per fixation
+    # in Pupil's clock). This is required because Pupil Capture's Online
+    # Fixation Detector publishes multiple events for the SAME fixation as
+    # it progresses (each with the same start_timestamp but growing
+    # `duration` and growing `dispersion`). Keeping every event in a plain
+    # deque produced ~3× more "fixation" records per 30-second window than
+    # the training data had, with the means of both `duration` and
+    # `dispersion` biased low — which the model read as "extremely focused
+    # gaze" and over-predicted `high` workload. By upserting on
+    # start_timestamp we collapse those multi-emit events to one record per
+    # fixation, carrying the FINAL (most complete) values — matching the
+    # one-row-per-fixation shape of `fixations_clean.parquet` at training
+    # time.
+    _fixations: dict[float, "_FixRec"] = field(default_factory=dict)
+    _fixations_max: int = field(default=1600, init=False)
 
     baseline: BaselineTracker = field(init=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -333,12 +369,26 @@ class SessionState:
         return accepted
 
     def add_fixations(self, fixations: list[_FixRec]) -> int:
+        # Upsert by start_timestamp. Pupil's Online Fixation Detector
+        # emits multiple events per fixation as it progresses (same
+        # start_timestamp, growing duration/dispersion). The last event for
+        # a given fixation carries the most complete values, so we
+        # overwrite earlier partial-state records. Net result: one record
+        # per real fixation — same shape as the training data.
         for f in fixations:
-            self._fixations.append(f)
+            # Re-insert (pop + set) so the dict's insertion order tracks
+            # *latest* arrival rather than the first one. That keeps the
+            # head-trim correct (oldest fixation onset gets evicted first).
+            self._fixations.pop(f.t, None)
+            self._fixations[f.t] = f
         n = len(fixations)
         self.fixations_received_total += n
         if n:
             self.last_fixation_received_at = time.time()
+        # Hard cap to bound memory under bizarre conditions (e.g. clock
+        # jumps); time-based trim below is the normal eviction path.
+        while len(self._fixations) > self._fixations_max:
+            self._fixations.pop(next(iter(self._fixations)))
         self._trim()
         self.last_seen_wall = time.time()
         return n
@@ -365,8 +415,15 @@ class SessionState:
             self._pupil.popleft()
         while self._blinks and self._blinks[0].t < blink_cutoff:
             self._blinks.popleft()
-        while self._fixations and self._fixations[0].t < fix_cutoff:
-            self._fixations.popleft()
+        # Insertion-ordered dict: the head is the oldest start_timestamp.
+        # Pop from the head until the next start_timestamp is inside the
+        # fixation window.
+        while self._fixations:
+            first_t = next(iter(self._fixations))
+            if first_t < fix_cutoff:
+                self._fixations.pop(first_t)
+            else:
+                break
 
     # ---- ui state ------------------------------------------------------- #
 
@@ -430,8 +487,8 @@ class SessionState:
             bd = np.empty(0)
 
         if self._fixations:
-            fd = np.array([f.duration for f in self._fixations], dtype=float)
-            fdisp = np.array([f.dispersion for f in self._fixations], dtype=float)
+            fd = np.array([f.duration for f in self._fixations.values()], dtype=float)
+            fdisp = np.array([f.dispersion for f in self._fixations.values()], dtype=float)
         else:
             fd = np.empty(0)
             fdisp = np.empty(0)

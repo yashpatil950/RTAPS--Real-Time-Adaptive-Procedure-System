@@ -20,11 +20,24 @@ import CalibrationScreen from '../components/CalibrationScreen';
 // frontend countdown matches what the backend needs.
 const CALIBRATION_DURATION_S = 120;
 
-// Workload level ordering — used to compute "highest level reached so far".
-// When the operator's predicted workload escalates (e.g. medium → high), we
-// keep showing the previous medium feedback alongside the new high feedback,
-// so they retain context.
-const LEVEL_RANK = { low: 0, medium: 1, high: 2 };
+// Valid workload labels emitted by the backend smoother.
+//
+// Display rule (operator UI):
+//   - Each step opens at "low" (no extra guidance shown).
+//   - When the backend smoother reports "high" (which already required
+//     3 s of model "high" in a row), the display flips to "high".
+//   - Once a step has reached "high", the display STAYS at "high" for
+//     the rest of that step — even if the model later drops back to
+//     "low". This is intentional: the operator should not see guidance
+//     appear and disappear within the same step. Sticky-within-step.
+//   - On the next step (operator checks the box and the active step
+//     advances), the display resets to "low" and the cycle repeats.
+//
+// The backend smoother is independent of this sticky behavior — it
+// reports the *true* current level. The dashboard (/streaming) shows
+// that raw smoothed level for ML inspection. Only this operator page
+// applies the sticky-within-step rule.
+const VALID_WORKLOAD_LEVELS = new Set(['low', 'medium', 'high']);
 
 const SessionView = () => {
   const { procedureId } = useParams();
@@ -60,11 +73,6 @@ const SessionView = () => {
   const [sessionEndTime, setSessionEndTime] = useState(null);
   const [isSessionComplete, setIsSessionComplete] = useState(false);
   const hasSavedAnalyticsRef = useRef(false);
-  const [devMode, setDevMode] = useState(() => {
-    try {
-      return localStorage.getItem('rtaps_dev_mode') === '1';
-    } catch (_) { return false; }
-  });
   const [blockedHintSteps, setBlockedHintSteps] = useState(new Set());
   // devExtraSeconds is still added into the session-timer math so the legacy
   // "+10s (dev)" mechanism doesn't break for anyone still using it programmatically.
@@ -72,21 +80,24 @@ const SessionView = () => {
   // eslint-disable-next-line no-unused-vars
   const [devExtraSeconds, setDevExtraSeconds] = useState(0);
   const [devExtraAtEnd, setDevExtraAtEnd] = useState(0);
-  
-  // Feature flag: Use workload-based feedback (new) vs time-threshold (old)
-  const [useWorkloadFeedback, setUseWorkloadFeedback] = useState(() => {
-    try {
-      return localStorage.getItem('rtaps_use_workload_feedback') !== '0'; // Default to true (new system)
-    } catch (_) { return true; }
-  });
+
+  // The workload-based feedback path is the only one the UI uses now. The
+  // legacy time-threshold fallback (and its dev toggle) has been removed —
+  // operator instructions are driven entirely by the model's smoothed
+  // workload level. This flag is kept as a const so the few remaining
+  // references read cleanly; it should not be turned off.
+  const useWorkloadFeedback = true;
   
   // Per-step workload state from the streaming ML backend.
-  // Format: { [stepId]: { current, highest, proba, decisionTime, rawLabel } }
-  // - current: latest smoothed label from the SSE stream
-  // - highest: the highest level the step has ever reached (sticky — does not
-  //            decrease even if `current` drops, so previous instructions stay
-  //            visible after escalation)
-  // - proba: per-class probabilities from the model
+  // Format: { [stepId]: { current, reachedHigh, proba, decisionTime, rawLabel } }
+  //   current      — latest smoothed label from the SSE stream (follows
+  //                  the backend smoother exactly).
+  //   reachedHigh  — sticky boolean: true once the step has ever shown
+  //                  "high". Drives the operator UI: while reachedHigh
+  //                  is true, the page keeps showing the "high"
+  //                  guidance even if `current` later drops to "low".
+  //                  Cleared on step transition because a fresh step
+  //                  starts with no entry in this dict.
   const [stepWorkloadStates, setStepWorkloadStates] = useState({});
   const [latestPrediction, setLatestPrediction] = useState(null);
   const [streamingHookReady, setStreamingHookReady] = useState(false);
@@ -166,20 +177,20 @@ const SessionView = () => {
     typeof window !== 'undefined' && isStreamingIntegrationEnabled() ? getStoredStreamId().trim() : '';
 
 
-  // Developer-controlled explanation detail preference
-  const [explanationLevel, setExplanationLevel] = useState(() => {
-    try {
-      const stored = localStorage.getItem('rtaps_explanation_level');
-      return stored === 'low' || stored === 'high' ? stored : 'medium';
-    } catch (_) {
-      return 'medium';
-    }
-  });
   
   // Subscribe to live predictions from the streaming ML backend.
-  // Each prediction carries (step_number, workload_label) — we map it back to
-  // the step on this page and update state. `highest` is sticky so previous
-  // medium instructions remain visible when the level later escalates to high.
+  // Each prediction carries (step_number, workload_label). We map it
+  // back to the step on this page and store BOTH:
+  //   - current     : the latest smoothed level from the backend
+  //   - reachedHigh : a sticky-within-step flag that latches `true`
+  //                   the first time this step shows "high".
+  // The backend smoother already enforces the 3 s stability gate AND
+  // forces the displayed level back to "low" at each step transition.
+  // The reachedHigh latch lives on the frontend so we can keep the
+  // "high" guidance pinned for the rest of a step — even if the model
+  // later dips back to "low" — without polluting the backend's
+  // smoother semantics (the /streaming dashboard still sees the true
+  // smoothed level).
   useEffect(() => {
     if (!procedure || typeof window === 'undefined') return undefined;
     const enabled = isStreamingIntegrationEnabled();
@@ -192,21 +203,22 @@ const SessionView = () => {
         if (!data || typeof data !== 'object') return;
         const label = data.workload_label;
         const stepNum = data.step_number;
-        if (!label || stepNum == null) return;
+        if (!label || !VALID_WORKLOAD_LEVELS.has(label) || stepNum == null) return;
         const step = procedure.steps.find((s) => s.stepNumber === stepNum);
         if (!step) return;
 
         setLatestPrediction(data);
         setStepWorkloadStates((prev) => {
-          const cur = prev[step.id] || { current: 'low', highest: 'low' };
-          const curRank = LEVEL_RANK[cur.highest] ?? 0;
-          const newRank = LEVEL_RANK[label] ?? 0;
-          const highest = newRank > curRank ? label : cur.highest;
+          const cur = prev[step.id] || { current: 'low', reachedHigh: false };
+          // Latch on the first "high" for this step; never clear it
+          // until the step ends (whereupon the entry is dropped because
+          // a fresh step starts with no key in this dict).
+          const reachedHigh = cur.reachedHigh || label === 'high';
           return {
             ...prev,
             [step.id]: {
               current: label,
-              highest,
+              reachedHigh,
               proba: data.workload_proba || null,
               decisionTime: data.decision_time || null,
               rawLabel: data.raw_workload_label || null,
@@ -329,20 +341,22 @@ const SessionView = () => {
   };
 
   // Resolve the workload level to display for a given step.
-  //   1. If we've ever received a streaming prediction for this step, use the
-  //      *highest* level it ever reached (sticky — preserves accumulated
-  //      instructions after escalation, then de-escalation).
-  //   2. Otherwise (warm-up period, streaming disabled, or no model data),
-  //      fall back to a time-threshold escalation:  past threshold → medium,
-  //      past 1.5× threshold → high. This keeps the UI useful even when ML
-  //      isn't connected.
+  //
+  //   1. No prediction yet for this step (warm-up, streaming disabled,
+  //      or operator just arrived on the step) → "low". The operator
+  //      sees the clean view first.
+  //   2. Step has reached "high" at any point (reachedHigh latch is set)
+  //      → "high". This is the sticky-within-step rule: once guidance
+  //      has been shown, it stays for the rest of the step. The latch
+  //      is cleared automatically when the operator advances to the
+  //      next step (the new step has no entry in stepWorkloadStates).
+  //   3. Otherwise → the live `current` from the backend smoother
+  //      (which is "low" until 3 s of model "high" arrives).
   const getStepDisplayLevel = (step) => {
     const wl = stepWorkloadStates[step.id];
-    if (wl && wl.highest) return wl.highest;
-    const t = stepTimes[step.id] || 0;
-    if (t >= step.timeThreshold * 1.5) return 'high';
-    if (t >= step.timeThreshold) return 'medium';
-    return 'low';
+    if (!wl) return 'low';
+    if (wl.reachedHigh) return 'high';
+    return wl.current || 'low';
   };
 
   const formatTime = (seconds) => {
@@ -438,39 +452,6 @@ const SessionView = () => {
             </span>
           </div>
         ) : null}
-        <div className="flex items-center justify-between mb-2">
-          <div className="text-left">
-            <div className="space-y-2">
-              <label className="inline-flex items-center space-x-2 text-sm text-gray-600 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={devMode}
-                  onChange={(e) => {
-                    const v = e.target.checked;
-                    setDevMode(v);
-                    try { localStorage.setItem('rtaps_dev_mode', v ? '1' : '0'); } catch(_){}
-                  }}
-                />
-                <span>Developer mode</span>
-              </label>
-              {devMode && (
-                <label className="inline-flex items-center space-x-2 text-sm text-gray-600 cursor-pointer block">
-                  <input
-                    type="checkbox"
-                    checked={useWorkloadFeedback}
-                    onChange={(e) => {
-                      const v = e.target.checked;
-                      setUseWorkloadFeedback(v);
-                      try { localStorage.setItem('rtaps_use_workload_feedback', v ? '1' : '0'); } catch(_){}
-                    }}
-                  />
-                  <span>Use Workload Feedback (New System)</span>
-                </label>
-              )}
-            </div>
-          </div>
-          <div></div>
-        </div>
         <div className={`text-4xl font-bold mb-2 ${isSessionComplete ? 'text-green-600' : 'text-blue-600'}`}>
           {sessionStartTime == null
             ? formatTime(0)
@@ -559,25 +540,31 @@ const SessionView = () => {
                 )}
 
                 {/*
-                 * Workload-based instructions, with CUMULATIVE display:
-                 *  - At medium  → show medium key points
-                 *  - At high    → show medium key points  AND  detailed why/what/how
-                 *  - Once a higher level is reached for a step, the lower-level
-                 *    block stays visible (uses `highest`, not `current`).
+                 * Workload-based instructions. Display level is resolved
+                 * by getStepDisplayLevel() above:
+                 *   - low    → no extra block (clean base instructions only)
+                 *   - medium → key points (v4 is 2-class so dead code, kept fwd-compat)
+                 *   - high   → key points AND a detailed why/what/how block
                  *
-                 * Replaces the old image-on-timeout sub-step system.
+                 * Behavior:
+                 *  - The step opens at "low" and only flips to "high"
+                 *    after the backend smoother reports 3 consecutive
+                 *    seconds of model "high".
+                 *  - Once a step has reached "high", the display stays
+                 *    at "high" for the rest of that step — even if the
+                 *    model later drops back to "low". (Operators should
+                 *    not see guidance pop in and out within one step.)
+                 *  - On the next step, the latch is cleared and the
+                 *    "low → 3 s of high → high" cycle restarts.
                  */}
                 {useWorkloadFeedback && (() => {
                   // Only show guidance for the active step
                   if (!isActiveStep) return null;
 
-                  // The display level is sticky: it's the highest workload the
-                  // model has predicted for this step so far. In dev mode the
-                  // explanation level toggle overrides the model.
-                  let displayLevel = getStepDisplayLevel(step);
-                  if (devMode && explanationLevel) {
-                    displayLevel = explanationLevel === 'low' ? 'medium' : explanationLevel;
-                  }
+                  // Use the current smoothed level directly — no manual
+                  // override, no client-side stickiness. Operator instructions
+                  // are driven entirely by the backend smoother.
+                  const displayLevel = getStepDisplayLevel(step);
                   if (displayLevel === 'low') return null;
 
                   const mediumFb = getStepFeedback(procedure.id, step.stepNumber, 'medium');
@@ -587,63 +574,24 @@ const SessionView = () => {
                       : null;
                   if (!mediumFb && !highFb) return null;
 
-                  const wl = stepWorkloadStates[step.id];
                   return (
                     <div className="mt-4 space-y-3">
-                      {/* Header strip — surfaces ML status when devMode */}
-                      <div className="flex items-center justify-between text-xs text-gray-600">
-                        <div className="flex items-center">
-                          <Lightbulb className="w-4 h-4 mr-2 text-yellow-600" />
-                          <span className="font-medium">
-                            Adaptive guidance:&nbsp;
-                            {displayLevel === 'high'
-                              ? 'Detailed (Medium + High)'
-                              : 'Additional (Medium)'}
-                          </span>
-                          {devMode && wl && (
-                            <span className="ml-3 text-gray-500">
-                              ML current: <span className="font-mono uppercase">{wl.current}</span>
-                              {wl.highest !== wl.current && (
-                                <>
-                                  {' · '}highest: <span className="font-mono uppercase">{wl.highest}</span>
-                                </>
-                              )}
-                            </span>
-                          )}
-                          {devMode && !wl && (
-                            <span className="ml-3 text-gray-400">(ML stream warming up — using time-threshold fallback)</span>
-                          )}
-                        </div>
-
-                        {devMode && (
-                          <div className="flex items-center text-xs text-gray-600">
-                            <span className="mr-2">Override:</span>
-                            <div className="inline-flex rounded-md border border-gray-300 bg-white overflow-hidden">
-                              {['low', 'medium', 'high'].map((level) => (
-                                <button
-                                  key={level}
-                                  type="button"
-                                  onClick={() => {
-                                    setExplanationLevel(level);
-                                    try {
-                                      localStorage.setItem('rtaps_explanation_level', level);
-                                    } catch (_) {}
-                                  }}
-                                  className={`px-2 py-1 font-medium text-xs ${
-                                    explanationLevel === level
-                                      ? 'bg-blue-600 text-white'
-                                      : 'text-gray-700 hover:bg-gray-50'
-                                  }`}
-                                >
-                                  {level.charAt(0).toUpperCase() + level.slice(1)}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        )}
+                      {/* Header strip — labels the type of adaptive guidance
+                          being shown. Driven entirely by the ML model; no
+                          manual override. */}
+                      <div className="flex items-center text-xs text-gray-600">
+                        <Lightbulb className="w-4 h-4 mr-2 text-yellow-600" />
+                        <span className="font-medium">
+                          Adaptive guidance:&nbsp;
+                          {displayLevel === 'high'
+                            ? 'Detailed (Medium + High)'
+                            : 'Additional (Medium)'}
+                        </span>
                       </div>
 
-                      {/* Medium block — shown for medium AND high (cumulative) */}
+                      {/* Medium key points — shown for medium AND high.
+                          With v4 (2-class) the model never emits "medium",
+                          so this branch only fires when displayLevel === 'high'. */}
                       {mediumFb && (
                         <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
                           <div className="flex items-center text-yellow-800 font-medium mb-2">
@@ -659,7 +607,7 @@ const SessionView = () => {
                         </div>
                       )}
 
-                      {/* High block — only when escalated, shown ON TOP of medium */}
+                      {/* High block — only when displayLevel is "high". */}
                       {highFb && highFb.content && (
                         <div className="bg-orange-50 border border-orange-200 rounded-lg p-3">
                           <div className="flex items-center text-orange-800 font-medium mb-2">

@@ -254,15 +254,69 @@ async def session_calibration_end(req: CalibrationEndRequest) -> SessionAck:
         raise HTTPException(404, f"No active session for stream_id={req.stream_id}")
     async with st.lock:
         ok = st.mark_calibration_end()
+        view = st.view()
+        # Pull live diagnostic state from the tracker — this is *much* more
+        # accurate than guessing from pupil_received_total alone.
+        acc0, acc1 = st.baseline.accumulator_counts()
+        explicit_active = st.baseline.explicit_active()
     if not ok:
+        pupil_total = view.get("pupil_received_total", 0)
+        all_streams = [s.stream_id for s in app.state.registry.all()]
+        other_active = [sid for sid in all_streams if sid != req.stream_id]
+        hint_lines = [
+            "Calibration ended but no usable pupil samples were collected.",
+            f"Diagnostics for stream_id={req.stream_id!r}:",
+            f"  pupil_received_total = {pupil_total}",
+            f"  baseline_accumulator = eye0:{acc0}  eye1:{acc1}",
+            f"  explicit_calibration_mode = {explicit_active}",
+        ]
+        if pupil_total == 0:
+            hint_lines.append(
+                "  → No pupil samples ever reached THIS session_id."
+            )
+            if other_active:
+                hint_lines.append(
+                    "  → Other active stream_ids on this backend: "
+                    + ", ".join(repr(s) for s in other_active)
+                    + ". The Pupil Capture bridge is likely running with a "
+                    "different --stream_id than the frontend is using. "
+                    "Restart the bridge with --stream_id matching the value "
+                    "shown in the frontend's streaming banner (or set "
+                    "localStorage.rtaps_pupil_stream_id before starting the "
+                    "session)."
+                )
+            else:
+                hint_lines.append(
+                    "  → No bridge is forwarding to the backend at all. "
+                    "Start `python pupil_capture_bridge.py --stream_id "
+                    f"{req.stream_id}` and try again."
+                )
+        elif not explicit_active:
+            hint_lines.append(
+                "  → calibration_start was never recorded for this session. "
+                "The frontend's calibration screen may not have called "
+                "/session/calibration_start before /session/calibration_end. "
+                "Try restarting the calibration."
+            )
+        elif acc0 == 0 and acc1 == 0:
+            hint_lines.append(
+                "  → calibration_start fired but ZERO pupil samples landed "
+                "in the baseline accumulator. The bridge probably stopped "
+                "forwarding samples between calibration_start and "
+                "calibration_end (check the bridge terminal). Or every "
+                "sample in that window failed the confidence filter — open "
+                "Pupil Capture and verify both eye windows are tracking "
+                "(green ellipses) before restarting calibration."
+            )
+        else:
+            hint_lines.append(
+                "  → Internal error: accumulators non-empty but finalize "
+                "still failed. Please report this."
+            )
         return SessionAck(
             stream_id=req.stream_id,
             status="calibration_insufficient_samples",
-            message=(
-                "Calibration ended but no usable pupil samples were collected. "
-                "Check that the Pupil Capture bridge was running and the operator's "
-                "eyes were tracked. Restart the calibration period."
-            ),
+            message="\n".join(hint_lines),
         )
     return SessionAck(
         stream_id=req.stream_id,

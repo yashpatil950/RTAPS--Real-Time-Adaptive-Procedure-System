@@ -33,6 +33,116 @@ FEATURE_NAMES: tuple[str, ...] = (
     "fixation_dispersion_mean",
 )
 
+# Training-distribution envelope per feature, computed from the 18,348
+# valid windows in `ML Algorithm/data/_processed/*/X_window.parquet`.
+# `lo` and `hi` are the 1st and 99th percentiles of the training data —
+# the model has effectively never seen values outside this range, so any
+# prediction made on a value beyond these bounds is an out-of-distribution
+# extrapolation. The strategy (see `settings.feature_sanitize_strategy`)
+# decides what to do with values outside [lo, hi]:
+#
+#   "clip" (DEFAULT) — clamp to [lo, hi]. Hands the model an in-envelope
+#             value that it has learned a class boundary for. Preserves
+#             the *direction* of the signal: a live blink rate of 49
+#             becomes 21, still high relative to the training median of
+#             3 but no longer extrapolating into untrained territory.
+#   "mask"  — replace with NaN. The training pipeline's SimpleImputer
+#             fills with the training MEDIAN (class-neutral), so the model
+#             effectively ignores that feature for this window. Useful
+#             when a sensor channel is producing nonsense, but with the
+#             v4_pnorm model three features (blink + both fixation
+#             stats) are normally OOD — masking them all biases output
+#             toward LOW because pupil features alone sit near their
+#             training median.
+#   "off"   — pass the live value straight through.
+#
+# Per-class medians on the new (v4_pnorm) labels:
+#     pupil_pcps_mean             low=0.011    high=0.064   (Δ +0.053)
+#     pupil_diam_slope            low=0.000    high=0.000   (Δ  0.000)
+#     blink_rate_30s              low=4.0      high=2.0     (Δ -2.0  — blink suppression at high load)
+#     fixation_dur_mean_ms        low=131.4    high=137.4   (Δ +6.0)
+#     fixation_dispersion_mean    low=1.20     high=1.16    (Δ -0.04)
+#
+# Permutation importance (v4_rf_pnorm.joblib):
+#     blink_rate_30s 0.160  pupil_pcps 0.147  fixation_dur 0.136
+#     fixation_dispersion 0.119  pupil_slope 0.031
+#
+# Regenerate bounds by running `07c_train_rf_pnorm.py` and inspecting
+# `X[col].describe(percentiles=[0.01, 0.99])`.
+FEATURE_TRAINING_BOUNDS: dict[str, tuple[float, float]] = {
+    "pupil_pcps_mean":          (-0.29, 1.04),
+    "pupil_diam_slope":         (-0.13, 0.13),
+    "blink_rate_30s":           (0.0,   21.0),
+    "fixation_dur_mean_ms":     (100.0, 211.0),
+    "fixation_dispersion_mean": (0.58,  1.37),
+}
+
+
+def sanitize_features_to_training_distribution(
+    features: dict[str, float | int | None],
+    *,
+    strategy: str = "clip",
+) -> tuple[dict[str, float | int | None], dict[str, str], dict[str, float]]:
+    """Bring live features into agreement with the training distribution.
+
+    Args:
+        features: raw live feature dict (the output of `extract_features`).
+        strategy: "mask" (out-of-distribution → NaN), "clip" (clamp to
+            training envelope), or "off" (pass through unchanged).
+
+    Returns:
+        (sanitized_features, actions, deltas) where:
+          * `sanitized_features` is the dict to hand to the model;
+          * `actions[name]` is "masked", "clipped", or absent (in-distribution);
+          * `deltas[name]` is the numeric change for clipped features (always
+            present alongside actions["clipped"]); for masked features it's
+            the value that was masked, useful for diagnostic logging.
+    """
+    if strategy == "off":
+        return dict(features), {}, {}
+
+    out: dict[str, float | int | None] = dict(features)
+    actions: dict[str, str] = {}
+    deltas: dict[str, float] = {}
+    for name, (lo, hi) in FEATURE_TRAINING_BOUNDS.items():
+        v = out.get(name)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv != fv:  # NaN — already missing, nothing to do
+            continue
+        if lo <= fv <= hi:
+            continue  # in-distribution, untouched
+
+        if strategy == "mask":
+            actions[name] = "masked"
+            deltas[name] = fv  # carry the original value for logging
+            out[name] = float("nan")
+        elif strategy == "clip":
+            clipped = min(hi, max(lo, fv))
+            actions[name] = "clipped"
+            deltas[name] = clipped - fv
+            out[name] = clipped
+        else:
+            raise ValueError(
+                f"Unknown sanitize strategy {strategy!r}; use 'mask', 'clip', or 'off'."
+            )
+    return out, actions, deltas
+
+
+# Back-compat alias — older callers used `clip_features_to_training_distribution`.
+# Keep them working but forward to the new function in clip mode.
+def clip_features_to_training_distribution(
+    features: dict[str, float | int | None],
+) -> tuple[dict[str, float | int | None], dict[str, float]]:
+    sanitized, _actions, deltas = sanitize_features_to_training_distribution(
+        features, strategy="clip"
+    )
+    return sanitized, deltas
+
 
 @dataclass(frozen=True)
 class PupilBaseline:

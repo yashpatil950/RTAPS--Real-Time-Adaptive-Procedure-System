@@ -2,9 +2,10 @@
 
 Once per `STRIDE_S` seconds we walk every active session, compute the 7
 features over its current window, run the prediction (locally or remote),
-pass the raw label through a WorkloadSmoother (30-second stability gate +
-direction guard), publish the stable result on the per-session SSE channel,
-and optionally POST it to the configured frontend webhook.
+pass the raw label through a WorkloadSmoother (configurable stability gate,
+default 3 seconds, plus a direction guard), publish the stable result on the
+per-session SSE channel, and optionally POST it to the configured frontend
+webhook.
 
 Runs as a single background asyncio task started from the FastAPI lifespan
 (see `main.py`). One loop, no per-session timers — that keeps the cost
@@ -20,7 +21,11 @@ from typing import Optional
 
 from app.config import settings
 from app.fargate_client import predict_remote, push_prediction_webhook
-from app.feature_extractor import extract_features
+from app.feature_extractor import (
+    FEATURE_TRAINING_BOUNDS,
+    extract_features,
+    sanitize_features_to_training_distribution,
+)
 from app.predictor import LocalPredictor
 from app.session_state import SessionRegistry, SessionState
 from app.workload_smoother import WorkloadSmoother
@@ -51,7 +56,7 @@ class InferenceLoop:
         self,
         registry: SessionRegistry,
         predictor: Optional[LocalPredictor],
-        smoother_stability_s: int = 30,
+        smoother_stability_s: Optional[int] = None,
     ):
         self._registry = registry
         self._predictor = predictor
@@ -60,16 +65,35 @@ class InferenceLoop:
         self._sse_queues: dict[str, list[asyncio.Queue]] = {}
         # One WorkloadSmoother per active stream; created lazily.
         self._smoothers: dict[str, WorkloadSmoother] = {}
-        self._smoother_stability_s = smoother_stability_s
+        # Fall back to the env-tunable setting (default 3 s) when caller
+        # doesn't override. This keeps tests/explicit values working while
+        # honouring WORKLOAD_SMOOTHER_STABILITY_S in production.
+        self._smoother_stability_s = (
+            smoother_stability_s
+            if smoother_stability_s is not None
+            else settings.workload_smoother_stability_s
+        )
+        # Per-stream prediction counter for periodic feature logging.
+        self._tick_counts: dict[str, int] = {}
+        # Per-stream last-seen step number. Used to detect step transitions
+        # robustly: relying on `step_changed_at == decision_t` is fragile
+        # because pupil samples arrive at 120 Hz and the timestamps drift
+        # between the step-change POST and the next inference tick. This
+        # comparison just looks at the step *number* and fires on any
+        # change, including the very first prediction in a session.
+        self._last_step_seen: dict[str, int] = {}
 
     def _get_smoother(self, stream_id: str) -> WorkloadSmoother:
         if stream_id not in self._smoothers:
-            self._smoothers[stream_id] = WorkloadSmoother(self._smoother_stability_s)
+            self._smoothers[stream_id] = WorkloadSmoother(
+                self._smoother_stability_s, initial_level="low"
+            )
         return self._smoothers[stream_id]
 
     def drop_smoother(self, stream_id: str) -> None:
         """Call when a session ends so the smoother's memory is freed."""
         self._smoothers.pop(stream_id, None)
+        self._last_step_seen.pop(stream_id, None)
 
     # ---- lifecycle ------------------------------------------------------ #
 
@@ -78,6 +102,26 @@ class InferenceLoop:
             self._stop.clear()
             self._task = asyncio.create_task(self._run(), name="inference-loop")
             log.info("Inference loop started (stride=%.2fs)", settings.stride_s)
+            strat = settings.feature_sanitize_strategy
+            if strat in ("mask", "clip"):
+                bounds_str = "  ".join(
+                    f"{n}={lo:g}..{hi:g}" for n, (lo, hi) in FEATURE_TRAINING_BOUNDS.items()
+                )
+                desc = (
+                    "out-of-distribution → NaN (SimpleImputer fills with training median)"
+                    if strat == "mask"
+                    else "out-of-distribution → clamped to training envelope"
+                )
+                log.info(
+                    "Feature sanitize strategy=%r (%s). Training bounds: %s",
+                    strat, desc, bounds_str,
+                )
+            else:
+                log.info(
+                    "Feature sanitization DISABLED (FEATURE_SANITIZE_STRATEGY=off). "
+                    "Raw features will be sent to the model — out-of-distribution "
+                    "values may lock predictions to one class."
+                )
 
     async def stop(self) -> None:
         self._stop.set()
@@ -171,10 +215,16 @@ class InferenceLoop:
             cumulative = decision_t - st.session_started_at
             arrays = st.window_arrays()
             baseline = st.baseline.baseline()
-            step_changed = st.step_changed_at == decision_t  # True on the first tick after a step change
             proc_id = int(st.procedure_id)
             step_num = int(st.step_number)
             stream_id = st.stream_id
+            # Step transition is detected by comparing the current step
+            # number against the last one we saw a prediction for on this
+            # stream. Fires on the very first prediction of a session too
+            # (since the cache starts empty), which is exactly what we want
+            # — the smoother begins each step at "low".
+            step_changed = self._last_step_seen.get(stream_id) != step_num
+            self._last_step_seen[stream_id] = step_num
 
             features, is_valid, qa = extract_features(
                 pupil_t=arrays["pupil_t"],
@@ -192,33 +242,93 @@ class InferenceLoop:
                 min_data_yield=settings.min_data_yield,
             )
 
+        # ---- Feature sanitization (train-serve skew guard) ----
+        # Bring live features into the training-distribution envelope. The
+        # default is "mask": out-of-distribution values become NaN, which
+        # the training pipeline's SimpleImputer fills with the training
+        # median (class-neutral). That effectively drops the offending
+        # feature for the affected windows and lets the model fall back on
+        # the features that actually carry class signal (pupil + blink).
+        features_for_model, sanitize_actions, sanitize_deltas = (
+            sanitize_features_to_training_distribution(
+                features, strategy=settings.feature_sanitize_strategy,
+            )
+        )
+
+        # ---- Periodic diagnostic logging ----
+        log_every = settings.feature_log_every_n_ticks
+        if log_every > 0:
+            count = self._tick_counts.get(stream_id, 0) + 1
+            self._tick_counts[stream_id] = count
+            if count % log_every == 1:
+                def _fmt(d: dict[str, float | int | None]) -> str:
+                    parts = []
+                    for n in (
+                        "pupil_pcps_mean",
+                        "pupil_diam_slope",
+                        "blink_rate_30s",
+                        "fixation_dur_mean_ms",
+                        "fixation_dispersion_mean",
+                    ):
+                        v = d.get(n)
+                        if v is None or (isinstance(v, float) and v != v):
+                            parts.append(f"{n}=NaN")
+                        else:
+                            parts.append(f"{n}={float(v):.3f}")
+                    return "  ".join(parts)
+                log.info(
+                    "[%s] tick=%d raw_features: %s", stream_id, count, _fmt(features)
+                )
+                if sanitize_actions:
+                    detail = "  ".join(
+                        (f"{k}=masked(was {sanitize_deltas[k]:.3f})"
+                         if act == "masked"
+                         else f"{k}=clipped(delta {sanitize_deltas[k]:+.3f})")
+                        for k, act in sanitize_actions.items()
+                    )
+                    log.info(
+                        "[%s] tick=%d sanitized: %s", stream_id, count, detail
+                    )
+
         # Do not hold session lock during model / HTTP inference — blocks pupil & fixation ingress.
         try:
             if settings.fargate_inference_url:
-                raw_label, proba = await predict_remote(stream_id, decision_t, features)
+                raw_label, proba = await predict_remote(stream_id, decision_t, features_for_model)
                 source = "remote"
             else:
                 if self._predictor is None:
                     log.warning("No local predictor and no FARGATE_INFERENCE_URL set; skipping.")
                     return
-                raw_label, proba = self._predictor.predict(features)
+                raw_label, proba = self._predictor.predict(features_for_model)
                 source = "local"
         except Exception:
             log.exception("Inference failed for stream %s", stream_id)
             return
 
-        # Apply workload smoother: 30-second stability gate + direction guard.
+        # Apply workload smoother: stability gate (default 3 s).
+        # Every step starts at "low" — that's the operator-facing default
+        # ("no extra guidance"). The smoother then needs `stability_window_s`
+        # consecutive seconds of model "high" before it upgrades the display,
+        # and the same number of consecutive seconds of "low" before it
+        # downgrades back.
         smoother = self._get_smoother(stream_id)
         if step_changed:
-            # Clear the pending candidate so the new step's predictions
-            # accumulate fresh, but keep the currently shown level.
-            smoother.reset_candidate()
+            smoother.force_level("low")
+            log.info(
+                "[%s] step %d started — workload display reset to LOW (3 s of model 'high' required to upgrade)",
+                stream_id, step_num,
+            )
         stable_label = smoother.update(raw_label)
 
         # Sanitize NaN/inf values in the response payload (the predictor has
         # already consumed `features` directly, so NaNs went through HGB
         # natively; here we convert them to None for JSON serialization).
+        # `feature_values` shows the RAW live values (what the sensor pipeline
+        # actually computed). `feature_values_model_input` shows what was fed
+        # to the model after clipping — these differ only when clipping kicked
+        # in, in which case `feature_clip_deltas` carries the change.
         feature_values_safe = _json_safe(features)
+        feature_values_model_safe = _json_safe(features_for_model)
         qa_safe = _json_safe(qa)
 
         prediction: dict = {
@@ -234,6 +344,9 @@ class InferenceLoop:
             "workload_proba": proba,
             "smoother_state": smoother.state_dict(),
             "feature_values": feature_values_safe,
+            "feature_values_model_input": feature_values_model_safe,
+            "feature_sanitize_actions": sanitize_actions,
+            "feature_sanitize_deltas": sanitize_deltas,
             "inference_source": source,
             "is_valid_window": bool(is_valid),
             "notes": None if is_valid else "low data yield in window — prediction may be unreliable",

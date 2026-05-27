@@ -49,6 +49,51 @@ class Settings:
     expected_pupil_rate_hz_per_eye: float = _env_float("EXPECTED_PUPIL_RATE_HZ", 60.0)
     min_data_yield: float = _env_float("MIN_DATA_YIELD", 0.6)
 
+    # ---- Workload smoother -----------------------------------------------
+    # Consecutive seconds the new candidate label must hold before the
+    # displayed instruction level changes. Lower values = more responsive UI
+    # (instructions change ~3 s after the model first sees the new level),
+    # higher values = more stable but laggier. Direction-guarded one step at
+    # a time (low ↔ medium ↔ high).
+    workload_smoother_stability_s: int = _env_int("WORKLOAD_SMOOTHER_STABILITY_S", 3)
+
+    # ---- Feature sanitization (train/serve skew guard) ------------------
+    # Training data (`X_window.parquet`) has tight per-feature distributions
+    # (computed from offline Pupil-player exports). Three live features
+    # consistently drift outside those bounds:
+    #
+    #     feature                     training 99th   live typical
+    #     ---------------------------------------------------------
+    #     fixation_dur_mean_ms        211             ~300
+    #     fixation_dispersion_mean    1.36            ~1.9
+    #     blink_rate_30s              21              ~30–50   (more
+    #         blinks than the research-subject training population)
+    #
+    # The v4 retrain on the new Y labels has much more balanced
+    # permutation importance (blink 16 %, pupil_pcps 15 %, fixation_dur
+    # 14 %, fixation_dispersion 12 %, pupil_slope 3 %) — no single feature
+    # dominates the way fixation did in the previous model — so the
+    # old "lock to HIGH on OOD fixations" failure mode is much milder.
+    #
+    # Strategy options:
+    #   "clip" (DEFAULT) — clamp out-of-distribution values to the
+    #       [1st-%ile, 99th-%ile] training envelope. Preserves the
+    #       *direction* of each feature (high blink stays high, just
+    #       capped at 21 instead of 49), which is what we want when
+    #       the model has no single dominant feature.
+    #   "mask" — replace OOD values with NaN. SimpleImputer fills with
+    #       the training median (class-neutral). With three OOD
+    #       features in normal operation this neutralises 60 % of the
+    #       model's inputs, biasing predictions toward LOW — useful
+    #       only if a feature is producing nonsense (e.g. a stuck
+    #       detector), not as a default.
+    #   "off"  — pass live values straight through.
+    feature_sanitize_strategy: str = os.getenv("FEATURE_SANITIZE_STRATEGY", "clip")
+    # Diagnostic: log raw feature values (and sanitization deltas if any)
+    # every N prediction ticks. 0 disables. Default 10 → roughly every
+    # 10 s of operating time so the operator can sanity-check at a glance.
+    feature_log_every_n_ticks: int = _env_int("FEATURE_LOG_EVERY_N_TICKS", 10)
+
     # ---- Model -----------------------------------------------------------
     model_path: Path = _env_path(
         "MODEL_PATH",

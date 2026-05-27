@@ -136,12 +136,55 @@ class PupilBatcher:
         self._buffer: list[dict] = []
         self._opened_at = 0.0
         self._lock = threading.Lock()
+        # Diagnostic counters for samples we drop locally instead of sending.
+        # `bad_diameter` = Pupil 3D model emitted a negative/zero diameter_3d
+        # (model not fit yet). `low_confidence` = confidence below threshold.
+        self.dropped_bad_diameter = 0
+        self.dropped_low_confidence = 0
+        self._warned_bad_diameter = False
 
     def add(self, payload: dict) -> None:
         # Pupil v3 messages: 'diameter_3d' (mm) preferred over 'diameter' (px).
-        diameter = payload.get("diameter_3d") or payload.get("diameter") or 0.0
+        # NOTE: don't use `a or b` chains here — negative numbers are truthy in
+        # Python, so a corrupt `diameter_3d=-25.0` would short-circuit past the
+        # fallback. Pick `diameter_3d` only when it is strictly positive, then
+        # fall back to 2D `diameter` (px) if 3D isn't usable.
+        d3 = payload.get("diameter_3d")
+        try:
+            d3f = float(d3) if d3 is not None else 0.0
+        except (TypeError, ValueError):
+            d3f = 0.0
+        if d3f > 0.0:
+            diameter = d3f
+        else:
+            d2 = payload.get("diameter") or 0.0
+            try:
+                diameter = float(d2)
+            except (TypeError, ValueError):
+                diameter = 0.0
+
+        # Pupil Capture's 3D eye model emits negative / wildly-out-of-range
+        # `diameter_3d` while the model is being fit (typically the first few
+        # seconds, or until you click "Calibrate" in Pupil Capture). Skip these
+        # — they would be 422-rejected by the backend's Pydantic guard
+        # (`diameter: Field(ge=0.0)`), and a single bad sample takes the WHOLE
+        # batch down. Skipping locally keeps the good samples flowing.
+        if diameter <= 0.0:
+            self.dropped_bad_diameter += 1
+            if not self._warned_bad_diameter:
+                self._warned_bad_diameter = True
+                log.warning(
+                    "Pupil sent diameter<=0 (got %.3f). The 3D eye model isn't "
+                    "fit yet — open Pupil Capture and run its screen-marker "
+                    "calibration (Calibration → Screen Marker). Until then "
+                    "samples are being dropped.",
+                    d3f if d3 is not None else 0.0,
+                )
+            return
+
         confidence = float(payload.get("confidence", 0.0))
         if confidence < self._min_confidence:
+            self.dropped_low_confidence += 1
             return
         sample = {
             "timestamp": float(payload.get("timestamp", time.time())),
@@ -363,23 +406,40 @@ def main() -> int:
             if now - last_summary >= 30.0:
                 last_summary = now
                 log.info(
-                    "Bridge counters (last 30 s+): pupil=%d  blink=%d  fixation=%d  notify=%d  other=%d",
+                    "Bridge counters (last 30 s+): pupil=%d  blink=%d  fixation=%d  notify=%d  other=%d "
+                    "(dropped: bad_diameter=%d low_confidence=%d)",
                     counts.get("pupil", 0),
                     counts.get("blink", 0),
                     counts.get("fixation", 0),
                     counts.get("notify", 0),
                     counts.get("other", 0),
+                    batcher.dropped_bad_diameter,
+                    batcher.dropped_low_confidence,
                 )
                 if counts.get("fixation", 0) == 0:
                     log.warning(
-                        "No fixations received yet. Check Pupil Capture → Plugin Manager "
-                        "→ Online Fixation Detector is enabled."
+                        "No fixations received yet. Fixations require gaze data, "
+                        "which means Pupil Capture must itself be calibrated "
+                        "(Calibration → Screen Marker). Loading the Online "
+                        "Fixation Detector plugin alone is not enough — no "
+                        "gaze means no fixations."
                     )
                 if counts.get("blink", 0) == 0:
                     log.warning(
                         "No blinks received yet. Check Pupil Capture → Plugin Manager "
                         "→ Online Blink Detector is enabled."
                     )
+                if batcher.dropped_bad_diameter > 0 and counts.get("pupil", 0) > 0:
+                    pct = 100.0 * batcher.dropped_bad_diameter / (
+                        counts.get("pupil", 0) + batcher.dropped_bad_diameter
+                    )
+                    if pct >= 5.0:
+                        log.warning(
+                            "%.1f%% of pupil samples have invalid diameter_3d "
+                            "(3D model not fit). Run Pupil Capture's screen-marker "
+                            "calibration to stabilize the 3D model.",
+                            pct,
+                        )
     except KeyboardInterrupt:
         log.info("Interrupted; exiting. Final counts: %s", counts)
     finally:
