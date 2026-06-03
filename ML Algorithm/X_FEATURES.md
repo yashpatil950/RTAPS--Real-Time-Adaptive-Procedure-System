@@ -51,10 +51,14 @@ can responsibly support ~5–10 features, not 48.
 | 1 | `pupil_pcps_mean` | How dilated the pupil is versus that person's own first-2-minute calm size | pupil samples + per-session 120 s baseline | % change in pupil size vs. participant baseline | The canonical cognitive-load marker. Direct sympathetic-nervous-system response. Baseline-normalized so it's directly comparable across participants. |
 | 2 | `blink_rate_per_min` | How often the person blinks (normal blinks only) | blink onset events | Blinks per minute (excluding tracking-loss blinks) | Cognitive blink suppression — well-validated workload marker; rate drops measurably under load. |
 | 3 | `fixation_dur_mean_ms` | How long they typically stay fixed on one gaze point | fixation events | Mean fixation duration (ms) | Long fixations indicate deeper visual processing / difficulty extracting information. |
-| 4 | `fixation_dispersion_mean` | How shaky or tight gaze stays during each fixation | fixation events | Within-fixation spatial jitter | Proxy for fixation quality and visual-attention stability. |
-| 5 | `procedure_id` | Which procedure template is running | RTAPS UI state | Which procedure is active (1=Centrifuge, 2=Column Flushing, 3=Pressure Testing) | Lets the model adjust feature interpretation per-procedure (e.g. baseline pupil dynamics differ across procedures). |
-| 6 | `step_number` | How far they are through the checklist | RTAPS UI state | Current step ordinal within the procedure | Lets the model learn step-specific patterns (some steps are inherently busier than others). |
-| 7 | `cumulative_session_time_s` | Session clock — how long they've been on task | session start timestamp | Seconds since the procedure started | Captures fatigue accumulating across a long session. |
+
+The current model uses **only the 3 sensor features above plus `pupil_diam_slope`** (4 total). The fields below are tracked for UI routing but are **not** model inputs — feeding `procedure_id` / `step_number` would let the model read the label off the step instead of the eyes (the label is derived from the step), and `cumulative_session_time_s` hurt leave-participants-out accuracy in testing. `fixation_dispersion_mean` was dropped (little added accuracy, correlated with `fixation_dur_mean_ms`).
+
+| field (not a model input) | meaning |
+|---|---|
+| `procedure_id` | Which procedure is active (1=Centrifuge, 2=Column Flushing, 3=Pressure Testing). |
+| `step_number` | Current step ordinal within the procedure. |
+| `cumulative_session_time_s` | Seconds since the procedure started. |
 
 ### Per-feature rationale and citations
 
@@ -119,7 +123,7 @@ Strict-policy training set (no proxy, no fallback) using the 7 features above:
 |---|---|
 | `pupil_pcps_mean` | **16 / 23** (offline export or live streaming) |
 | `blink_rate_per_min` | 19 / 23 |
-| `fixation_dur_mean_ms`, `fixation_dispersion_mean` | 22 / 23 |
+| `fixation_dur_mean_ms` | 22 / 23 |
 | `procedure_id`, `step_number`, `cumulative_session_time_s` | 23 / 23 |
 
 Effective trainable set: **16 sessions across 9 participants** (we lose P9 and
@@ -149,7 +153,6 @@ All 8 features are extractable live. Source map for the deployed system:
 | `pupil_pcps_mean` | Pupil Capture ZMQ `pupil.` topic + per-session 120 s baseline tracker | Pupil ingestion ✅; baseline tracker ✅ built in `session_state.py` |
 | `blink_rate_per_min` | Pupil Capture ZMQ `blink` topic (Online Blink Detector plugin) | Bridge ✅ (`pupil_capture_bridge.py`); backend endpoint ✅ `/stream/blinks` |
 | `fixation_dur_mean_ms` | Pupil Capture ZMQ `fixation` topic (Online Fixation Detector plugin) | Bridge ✅; backend endpoint ✅ `/stream/fixations`. **Plugin must be ON in Pupil Capture.** |
-| `fixation_dispersion_mean` | same as `fixation_dur_mean_ms` | same as above |
 | `procedure_id` | RTAPS frontend `POST /session/start` | Endpoint ✅ |
 | `step_number` | RTAPS frontend `POST /session/step_change` | Endpoint ✅ |
 | `cumulative_session_time_s` | derived from session-start timestamp per `stream_id` | ✅ computed in `inference_loop.py` |

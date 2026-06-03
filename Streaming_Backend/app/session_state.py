@@ -488,10 +488,8 @@ class SessionState:
 
         if self._fixations:
             fd = np.array([f.duration for f in self._fixations.values()], dtype=float)
-            fdisp = np.array([f.dispersion for f in self._fixations.values()], dtype=float)
         else:
             fd = np.empty(0)
-            fdisp = np.empty(0)
 
         return {
             "pupil_t": pt,
@@ -499,7 +497,6 @@ class SessionState:
             "pupil_diam": pd_,
             "blink_durations_s": bd,
             "fix_durations_s": fd,
-            "fix_dispersion": fdisp,
         }
 
     def is_ready_for_inference(self) -> bool:

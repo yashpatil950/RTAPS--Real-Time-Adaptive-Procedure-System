@@ -1,11 +1,13 @@
-"""Live feature extractor — produces the 5 sensor-only features the v4 model expects.
+"""Live feature extractor — produces the 4 sensor-only features the model expects.
 
-v4 contract (sensors-only, no step/procedure leakage):
+Contract (sensors-only, no step/procedure leakage):
     pupil_pcps_mean        — over the last 10 s of pupil samples
     pupil_diam_slope       — over the last 10 s of pupil samples
     blink_rate_30s         — count of non-tracking-loss blinks in last 30 s
     fixation_dur_mean_ms   — mean fixation duration in last 30 s (ms)
-    fixation_dispersion_mean — mean fixation dispersion in last 30 s
+
+(fixation_dispersion_mean was dropped — it added little accuracy and was
+correlated with fixation_dur_mean_ms.)
 
 Formulas mirror `ML Algorithm/scripts/lib/{pupil,blink,fixation}_features.py`
 exactly so that training-time and serving-time values are comparable. Anything
@@ -23,14 +25,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Order MUST match `FEATURE_COLS` in `ML Algorithm/scripts/07c_train_rf_pnorm.py`.
+# Order MUST match `FEATURE_COLS` in `ML Algorithm/scripts/07d_train_rf_tuned.py`.
 # Sensor features only — no step/procedure leakage.
 FEATURE_NAMES: tuple[str, ...] = (
     "pupil_pcps_mean",
     "pupil_diam_slope",
     "blink_rate_30s",
     "fixation_dur_mean_ms",
-    "fixation_dispersion_mean",
 )
 
 # Training-distribution envelope per feature, computed from the 18,348
@@ -49,32 +50,16 @@ FEATURE_NAMES: tuple[str, ...] = (
 #   "mask"  — replace with NaN. The training pipeline's SimpleImputer
 #             fills with the training MEDIAN (class-neutral), so the model
 #             effectively ignores that feature for this window. Useful
-#             when a sensor channel is producing nonsense, but with the
-#             v4_pnorm model three features (blink + both fixation
-#             stats) are normally OOD — masking them all biases output
-#             toward LOW because pupil features alone sit near their
-#             training median.
+#             when a sensor channel is producing nonsense.
 #   "off"   — pass the live value straight through.
 #
-# Per-class medians on the new (v4_pnorm) labels:
-#     pupil_pcps_mean             low=0.011    high=0.064   (Δ +0.053)
-#     pupil_diam_slope            low=0.000    high=0.000   (Δ  0.000)
-#     blink_rate_30s              low=4.0      high=2.0     (Δ -2.0  — blink suppression at high load)
-#     fixation_dur_mean_ms        low=131.4    high=137.4   (Δ +6.0)
-#     fixation_dispersion_mean    low=1.20     high=1.16    (Δ -0.04)
-#
-# Permutation importance (v4_rf_pnorm.joblib):
-#     blink_rate_30s 0.160  pupil_pcps 0.147  fixation_dur 0.136
-#     fixation_dispersion 0.119  pupil_slope 0.031
-#
-# Regenerate bounds by running `07c_train_rf_pnorm.py` and inspecting
+# Regenerate bounds by running `07d_train_rf_tuned.py` and inspecting
 # `X[col].describe(percentiles=[0.01, 0.99])`.
 FEATURE_TRAINING_BOUNDS: dict[str, tuple[float, float]] = {
     "pupil_pcps_mean":          (-0.29, 1.04),
     "pupil_diam_slope":         (-0.13, 0.13),
     "blink_rate_30s":           (0.0,   21.0),
     "fixation_dur_mean_ms":     (100.0, 211.0),
-    "fixation_dispersion_mean": (0.58,  1.37),
 }
 
 
@@ -172,7 +157,6 @@ def extract_features(
     pupil_diam_mm: np.ndarray,
     blink_durations_s: np.ndarray,
     fix_durations_s: np.ndarray,
-    fix_dispersion: np.ndarray,
     baseline: PupilBaseline | None,
     procedure_id: int,
     step_number: int,
@@ -181,7 +165,7 @@ def extract_features(
     expected_pupil_rate_hz_per_eye: float,
     min_data_yield: float,
 ) -> tuple[dict[str, float | int | None], bool, dict[str, float]]:
-    """Compute the 5 v4 sensor features over the supplied window slices.
+    """Compute the 4 sensor features over the supplied window slices.
 
     Args:
         pupil_t / pupil_eye / pupil_diam_mm: aligned arrays of confidence-
@@ -189,12 +173,12 @@ def extract_features(
             10-second pupil window.
         blink_durations_s: durations of non-tracking-loss blinks whose start
             timestamps fall inside the current 30-second blink window.
-        fix_durations_s / fix_dispersion: aligned arrays of fixations whose
-            start timestamps fall inside the current 30-second fixation window.
+        fix_durations_s: durations of fixations whose start timestamps fall
+            inside the current 30-second fixation window.
         baseline: per-session pupil baseline (or None if not yet ready).
         procedure_id / step_number / cumulative_session_time_s: live task
             context — passed through for prediction stamping but NOT used as
-            model inputs in v4.
+            model inputs.
 
     Returns:
         (features, is_valid, qa) where:
@@ -238,19 +222,11 @@ def extract_features(
     n_fix = int(len(fix_durations_s))
     fix_dur_mean_ms = float(np.mean(fix_durations_s) * 1000.0) if n_fix else float("nan")
 
-    # ---- fixation_dispersion_mean --------------------------------------- #
-    if n_fix:
-        disp_clean = fix_dispersion[~np.isnan(fix_dispersion)]
-        fix_disp_mean = float(np.mean(disp_clean)) if len(disp_clean) else float("nan")
-    else:
-        fix_disp_mean = float("nan")
-
     features: dict[str, float | int | None] = {
         "pupil_pcps_mean": pcps_mean,
         "pupil_diam_slope": pupil_slope,
         "blink_rate_30s": blink_rate_30s,
         "fixation_dur_mean_ms": fix_dur_mean_ms,
-        "fixation_dispersion_mean": fix_disp_mean,
     }
 
     is_valid = (pupil_data_yield >= min_data_yield) or (n_fix >= 1)

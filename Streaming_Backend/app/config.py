@@ -59,21 +59,18 @@ class Settings:
 
     # ---- Feature sanitization (train/serve skew guard) ------------------
     # Training data (`X_window.parquet`) has tight per-feature distributions
-    # (computed from offline Pupil-player exports). Three live features
+    # (computed from offline Pupil-player exports). Two live features
     # consistently drift outside those bounds:
     #
     #     feature                     training 99th   live typical
     #     ---------------------------------------------------------
     #     fixation_dur_mean_ms        211             ~300
-    #     fixation_dispersion_mean    1.36            ~1.9
     #     blink_rate_30s              21              ~30–50   (more
     #         blinks than the research-subject training population)
     #
-    # The v4 retrain on the new Y labels has much more balanced
-    # permutation importance (blink 16 %, pupil_pcps 15 %, fixation_dur
-    # 14 %, fixation_dispersion 12 %, pupil_slope 3 %) — no single feature
-    # dominates the way fixation did in the previous model — so the
-    # old "lock to HIGH on OOD fixations" failure mode is much milder.
+    # The model's permutation importance is fairly balanced across the
+    # four sensor features, so no single feature dominates and the old
+    # "lock to HIGH on OOD fixations" failure mode is mild.
     #
     # Strategy options:
     #   "clip" (DEFAULT) — clamp out-of-distribution values to the
@@ -82,11 +79,9 @@ class Settings:
     #       capped at 21 instead of 49), which is what we want when
     #       the model has no single dominant feature.
     #   "mask" — replace OOD values with NaN. SimpleImputer fills with
-    #       the training median (class-neutral). With three OOD
-    #       features in normal operation this neutralises 60 % of the
-    #       model's inputs, biasing predictions toward LOW — useful
-    #       only if a feature is producing nonsense (e.g. a stuck
-    #       detector), not as a default.
+    #       the training median (class-neutral) — useful only if a
+    #       feature is producing nonsense (e.g. a stuck detector),
+    #       not as a default.
     #   "off"  — pass live values straight through.
     feature_sanitize_strategy: str = os.getenv("FEATURE_SANITIZE_STRATEGY", "clip")
     # Diagnostic: log raw feature values (and sanitization deltas if any)

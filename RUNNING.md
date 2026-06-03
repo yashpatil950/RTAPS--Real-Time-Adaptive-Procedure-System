@@ -93,11 +93,10 @@ var, e.g. `WORKLOAD_SMOOTHER_STABILITY_S=5`.
 
 ### Feature sanitization
 
-Three live features routinely run outside the model's training envelope
-(blink_rate_30s, fixation_dur_mean_ms, fixation_dispersion_mean — the
-live detectors fire more events than the offline Pupil-player exports
-used for training). The backend handles this via
-`FEATURE_SANITIZE_STRATEGY`:
+Two live features routinely run outside the model's training envelope
+(blink_rate_30s, fixation_dur_mean_ms — the live detectors fire more
+events than the offline Pupil-player exports used for training). The
+backend handles this via `FEATURE_SANITIZE_STRATEGY`:
 
 | Strategy | Behavior | Use when |
 |---|---|---|

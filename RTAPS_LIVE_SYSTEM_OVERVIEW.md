@@ -99,10 +99,8 @@ The model uses **eight** inputs only. Full spec and rationale: **`ML Algorithm/X
 | 2 | `pupil_diam_slope` | Trend of pupil diameter over the **last ~10 s** (rising vs falling). |
 | 3 | `blink_rate_per_min` | Blinks per minute (tracking-loss blinks excluded). |
 | 4 | `fixation_dur_mean_ms` | Average fixation **duration** in the window (ms). |
-| 5 | `fixation_dispersion_mean` | Average fixation **spatial spread / jitter** (stability proxy). |
-| 6 | `procedure_id` | Which procedure (1–3). |
-| 7 | `step_number` | Current step index. |
-| 8 | `cumulative_session_time_s` | Seconds since session start (fatigue / drift). |
+
+(The model uses only the 4 sensor features above. `procedure_id`, `step_number`, and `cumulative_session_time_s` are tracked for UI routing but are **not** model inputs — using them would let the model read the answer off the step instead of the eyes.)
 
 ---
 

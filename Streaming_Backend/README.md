@@ -17,21 +17,25 @@ path.**
                   ▲                            │  per-stream sliding     │
                   │  SSE / GET                 │  10 s window  +  60 s   │
                   │  prediction                │  baseline + every 1 s   │
-                  │                            │  → 8 features → model   │
+                  │                            │  → 4 features → model   │
                   └─── /session/{id}/...  ◄────┘
 ```
 
 ## What this service computes
 
-The classifier consumes the **8 features** specified in
-`../ML Algorithm/X_FEATURES.md`:
+The classifier consumes **4 sensor-only features** (see
+`../ML Algorithm/X_FEATURES.md`):
 
 ```
-pupil_pcps_mean              fixation_dispersion_mean
-pupil_diam_slope             procedure_id
-blink_rate_per_min           step_number
-fixation_dur_mean_ms         cumulative_session_time_s
+pupil_pcps_mean
+pupil_diam_slope
+blink_rate_30s
+fixation_dur_mean_ms
 ```
+
+`procedure_id`, `step_number`, and `cumulative_session_time_s` are tracked
+for UI routing but are **not** model inputs (using them would let the model
+read the answer off the step instead of the eyes).
 
 The live extractor in `app/feature_extractor.py` mirrors the training
 formulas exactly. The predictor refuses to start if the loaded model's
@@ -80,9 +84,8 @@ A prediction looks like:
   "feature_values": {
     "pupil_pcps_mean": 0.034,
     "pupil_diam_slope": 0.0042,
-    "blink_rate_per_min": 14.4,
+    "blink_rate_30s": 3,
     "fixation_dur_mean_ms": 187.3,
-    "fixation_dispersion_mean": 1.21,
     "procedure_id": 1,
     "step_number": 4,
     "cumulative_session_time_s": 312.4

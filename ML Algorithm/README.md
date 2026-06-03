@@ -4,7 +4,7 @@ The **Real-Time Adaptive Procedure System** watches an operator's eyes while the
 
 This folder contains everything that turns recorded eye-tracking data into the model the live system uses: the training scripts, the feature spec, the labels, and the saved model artifact.
 
-> **Currently deployed model:** `models/v4_rf_pnorm.joblib`Random Forest, 5 sensor-only features, 2-class output (`low` / `high`), labels derived by k-means clustering of per-step VACP `p_normalized`.
+> **Currently deployed model:** `models/v5_rf_tuned.joblib` — Random Forest (Optuna-tuned), 4 sensor-only features, 2-class output (`low` / `high`), labels derived by k-means clustering of per-step VACP `p_normalized`.
 
 For the live serving stack see `Streaming_Backend/`. For the feature contract see `X_FEATURES.md`.
 
@@ -12,7 +12,7 @@ For the live serving stack see `Streaming_Backend/`. For the feature contract se
 
 ## 1. What the model does, in one paragraph
 
-Every second, the backend grabs the last 10 s of pupil samples and the last 30 s of blinks and fixations. It turns those into **5 numbers** (the features). The Random Forest looks at those 5 numbers and outputs a probability for each class (`low`, `high`). The label with the highest probability is the "raw" prediction. A smoother makes sure the on-screen instructions only change when that raw label is stable for a few seconds in a row.
+Every second, the backend grabs the last 10 s of pupil samples and the last 30 s of blinks and fixations. It turns those into **4 numbers** (the features). The Random Forest looks at those 4 numbers and outputs a probability for each class (`low`, `high`). The label with the highest probability is the "raw" prediction. A smoother makes sure the on-screen instructions only change when that raw label is stable for a few seconds in a row.
 
 That's the whole thing. No procedure-id, no step-number, no session-clock — those would let the model cheat by memorising the procedure instead of learning physiology. v4 strips them so the model has to look at the eyes.
 
@@ -106,7 +106,7 @@ data/_processed/
 
 ---
 
-## 4. Features (X) — the 5 numbers the model sees
+## 4. Features (X) — the 4 numbers the model sees
 
 The order **must** match `FEATURE_NAMES` in `Streaming_Backend/app/feature_extractor.py`:
 
@@ -116,7 +116,8 @@ The order **must** match `FEATURE_NAMES` in `Streaming_Backend/app/feature_extra
 | 2 | `pupil_diam_slope` | 10 s | Is the pupil getting bigger or smaller right now? (slope of diameter over the last 10 s) |
 | 3 | `blink_rate_30s` | 30 s | Number of (real, non-tracking-loss) blinks in the last 30 s. Cognitive load tends to **suppress** blinking, so high workload usually = fewer blinks. |
 | 4 | `fixation_dur_mean_ms` | 30 s | Average length of each fixation (the periods when the eyes are still). Longer fixations = deeper processing. |
-| 5 | `fixation_dispersion_mean` | 30 s | How tightly clustered the gaze is within each fixation. Lower = more focused. |
+
+(`fixation_dispersion_mean` was removed — it added little accuracy and correlated with `fixation_dur_mean_ms`.)
 
 **Why different windows per feature?** Pupil samples are dense (120 Hz), so 10 s gives a stable mean. Blinks and fixations are sparse — a 10 s slice often contains 0 or 1 events, which is too noisy. 30 s smooths them out without losing responsiveness.
 
@@ -258,7 +259,7 @@ Saved as a dict (so the live `LocalPredictor` can validate the contract):
 ```python
 {
     "model": <Pipeline>,                # the sklearn Pipeline above
-    "feature_columns": [...5 features...],
+    "feature_columns": [...4 features...],
     "label_order": ["low", "high"],
     ...metrics, label_meta...
 }
@@ -304,15 +305,16 @@ Saved as a dict (so the live `LocalPredictor` can validate the contract):
 
 Permutation importance is the gold standard (shuffle one feature, measure the F1 drop):
 
+Current values live in `models/rf_tuned_feature_importance.csv`. For the 4-feature model they come out roughly:
+
 | Feature | Permutation importance | Gini importance |
 | --- | --- | --- |
-| `blink_rate_30s` | **0.160** | 0.217 |
-| `pupil_pcps_mean` | 0.147 | 0.232 |
-| `fixation_dur_mean_ms` | 0.136 | 0.286 |
-| `fixation_dispersion_mean` | 0.119 | 0.196 |
-| `pupil_diam_slope` | 0.031 | 0.069 |
+| `pupil_pcps_mean` | **0.235** | 0.280 |
+| `fixation_dur_mean_ms` | 0.213 | 0.417 |
+| `blink_rate_30s` | 0.212 | 0.180 |
+| `pupil_diam_slope` | 0.078 | 0.124 |
 
-All five sensor features contribute non-zero importance and the distribution is balanced — no single feature dominates. (Earlier model versions had fixation features pinned at \~48 % combined gini, which caused live predictions to lock to "high" whenever the live fixation detector ran outside the training envelope. The new label scheme broke that dependency.)
+All four sensor features contribute non-zero importance and the distribution is balanced — no single feature dominates.
 
 ### Honest assessment
 
@@ -329,13 +331,12 @@ Even at κ ≈ 0.05, the model is *useful* for the UI: it correctly biases towar
 
 ## 9. Train-serve skew (the feature sanitization layer)
 
-The biggest non-obvious problem in v4 is that the live data is **not in the same distribution as the training data**. Three of the five features routinely fall outside the 1st-to-99th percentile envelope of the training set:
+The biggest non-obvious problem is that the live data is **not in the same distribution as the training data**. Two of the four features routinely fall outside the 1st-to-99th percentile envelope of the training set:
 
 | Feature | Training 99th-percentile | Live typical |
 | --- | --- | --- |
 | `blink_rate_30s` | 21 | 30–50 (this user blinks more than research subjects) |
 | `fixation_dur_mean_ms` | 211 ms | \~300 ms |
-| `fixation_dispersion_mean` | 1.37° | \~1.9° |
 
 Why: the training data was processed offline via Pupil Player exports (strict, conservative event detection). The live data comes from Pupil Capture's **Online** Fixation and Blink Detectors, which fire more events and report longer/wider fixations. Same biological signal, different summary statistics.
 
@@ -351,7 +352,6 @@ FEATURE_TRAINING_BOUNDS = {
     "pupil_diam_slope":         (-0.13, 0.13),
     "blink_rate_30s":           (0.0,   21.0),
     "fixation_dur_mean_ms":     (100.0, 211.0),
-    "fixation_dispersion_mean": (0.58,  1.37),
 }
 ```
 
@@ -360,7 +360,7 @@ When a live feature falls outside its `(lo, hi)` band, the sanitizer applies one
 | Strategy | What it does | When to use |
 | --- | --- | --- |
 | `clip` **(default)** | Clamp to `[lo, hi]`. A live `blink_rate_30s=49` becomes `21` — still high relative to the training median of 3 but inside trained territory. **Preserves the direction of the signal.** | Normal operation. |
-| `mask` | Replace with `NaN`. The pipeline's `SimpleImputer` then fills with the training median (class-neutral). **Kills the signal for that feature.** | Useful when a sensor is producing nonsense and you want it ignored. With three normally-OOD features this would silence 60 % of the model's input. |
+| `mask` | Replace with `NaN`. The pipeline's `SimpleImputer` then fills with the training median (class-neutral). **Kills the signal for that feature.** | Useful when a sensor is producing nonsense and you want it ignored. |
 | `off` | Pass through raw. | Diagnostics only. |
 
 ### Per-class medians (so you know what each value means to the model)
@@ -373,7 +373,6 @@ These are the medians of the training data after grouping by the new v4 labels �
 | `pupil_diam_slope` | 0.000 | 0.000 | 0.000 |
 | `blink_rate_30s` | 4.0 | 2.0 | **−2.0 (blink suppression at high load)** |
 | `fixation_dur_mean_ms` | 131 | 137 | +6 |
-| `fixation_dispersion_mean` | 1.20 | 1.16 | −0.04 |
 
 So at the *median*, high workload looks like: slightly bigger pupil, fewer blinks, slightly longer + more focused fixations. The within-class spread is much bigger than these median deltas, which is why the model only reaches κ ≈ 0.05 — but the directions are sound.
 
@@ -393,7 +392,7 @@ This is purely a UI debouncer — the raw model output is still logged and pushe
 
 ## 11. Live serving contract
 
-`Streaming_Backend/app/feature_extractor.py::FEATURE_NAMES` must equal v4's `FEATURE_COLS`. The `LocalPredictor` validates this on load and refuses to start on mismatch:
+`Streaming_Backend/app/feature_extractor.py::FEATURE_NAMES` must equal the model's `FEATURE_COLS`. The `LocalPredictor` validates this on load and refuses to start on mismatch:
 
 ```python
 FEATURE_NAMES = (
@@ -401,7 +400,6 @@ FEATURE_NAMES = (
     "pupil_diam_slope",
     "blink_rate_30s",
     "fixation_dur_mean_ms",
-    "fixation_dispersion_mean",
 )
 ```
 
@@ -411,7 +409,7 @@ The live request path each second:
 SessionState.window_arrays()         pull the last 10 s (pupil) / 30 s (blink+fixation)
         │
         ▼
-feature_extractor.extract_features() compute the 5 numbers
+feature_extractor.extract_features() compute the 4 numbers
         │
         ▼
 sanitize_features_to_training_distribution(strategy="clip")

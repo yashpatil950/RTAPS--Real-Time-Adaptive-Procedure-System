@@ -44,7 +44,6 @@ const FEATURE_ORDER = [
   'pupil_diam_slope',
   'blink_rate_30s',
   'fixation_dur_mean_ms',
-  'fixation_dispersion_mean',
 ];
 
 const PROCEDURE_NAMES = {

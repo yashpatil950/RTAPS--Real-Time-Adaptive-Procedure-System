@@ -232,7 +232,6 @@ class InferenceLoop:
                 pupil_diam_mm=arrays["pupil_diam"],
                 blink_durations_s=arrays["blink_durations_s"],
                 fix_durations_s=arrays["fix_durations_s"],
-                fix_dispersion=arrays["fix_dispersion"],
                 baseline=baseline,
                 procedure_id=proc_id,
                 step_number=step_num,
@@ -268,7 +267,6 @@ class InferenceLoop:
                         "pupil_diam_slope",
                         "blink_rate_30s",
                         "fixation_dur_mean_ms",
-                        "fixation_dispersion_mean",
                     ):
                         v = d.get(n)
                         if v is None or (isinstance(v, float) and v != v):

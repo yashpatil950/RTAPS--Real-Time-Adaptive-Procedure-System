@@ -13,9 +13,10 @@ Differences from 07c (the v4 production trainer):
   3. Outputs use the rf_tuned_* prefix and v5_rf_tuned.joblib so the
      v4 production model and rf_*.* metrics files are untouched.
 
-Same as 07c:
-  - 5 features (pupil_pcps_mean, pupil_diam_slope, blink_rate_30s,
-    fixation_dur_mean_ms, fixation_dispersion_mean)
+Same as 07c except feature set:
+  - 4 sensor features (pupil_pcps_mean, pupil_diam_slope, blink_rate_30s,
+    fixation_dur_mean_ms) — fixation_dispersion_mean dropped (little added
+    accuracy, correlated with fixation_dur_mean_ms)
   - p_normalized k-means label construction with balance floor
   - Step 0 excluded across all 3 procedures
   - GroupKFold (participant-grouped) inside the tuner — no leakage
@@ -77,7 +78,6 @@ FEATURE_COLS = [
     "pupil_diam_slope",
     "blink_rate_30s",
     "fixation_dur_mean_ms",
-    "fixation_dispersion_mean",
 ]
 GROUP_COL = "participant_id"
 LABEL_ORDER = ["low", "high"]
