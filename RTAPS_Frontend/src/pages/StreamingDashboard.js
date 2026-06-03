@@ -37,14 +37,45 @@ import {
   setStreamingIntegrationEnabled,
 } from '../services/streamingApi';
 
-// v4 sensor-only feature set — matches Streaming_Backend feature_extractor.FEATURE_NAMES
-// and ML Algorithm 07c_train_rf_pnorm.py FEATURE_COLS.
+// 4 sensor-only feature set — matches Streaming_Backend feature_extractor.FEATURE_NAMES
+// and ML Algorithm 07d_train_rf_tuned.py FEATURE_COLS.
 const FEATURE_ORDER = [
   'pupil_pcps_mean',
   'pupil_diam_slope',
   'blink_rate_30s',
   'fixation_dur_mean_ms',
 ];
+
+// Per-feature display metadata: unit suffix, look-back window, decimals, and a
+// plain-English tooltip. NOTE: the dashboard shows the RAW computed value; the
+// model receives a version clipped into the training range, so live values may
+// exceed the typical envelope described here.
+const FEATURE_META = {
+  pupil_pcps_mean: {
+    unit: 'ratio',
+    window: '10 s',
+    decimals: 3,
+    desc: "Pupil size vs the operator's calm baseline, averaged over the last 10 s. 0.05 = 5% larger than baseline. Bigger = more mental effort.",
+  },
+  pupil_diam_slope: {
+    unit: 'mm/s',
+    window: '10 s',
+    decimals: 4,
+    desc: 'Trend of pupil diameter over the last 10 s (slope of a line fit). Positive = dilating, negative = shrinking.',
+  },
+  blink_rate_30s: {
+    unit: 'blinks/30s',
+    window: '30 s',
+    decimals: 0,
+    desc: 'Count of (non-tracking-loss) blinks in the last 30 s. Cognitive load suppresses blinking, so fewer blinks ≈ higher load.',
+  },
+  fixation_dur_mean_ms: {
+    unit: 'ms',
+    window: '30 s',
+    decimals: 0,
+    desc: 'Average fixation duration over the last 30 s, in milliseconds (300 ms = 0.3 s). Longer fixations = deeper visual processing.',
+  },
+};
 
 const PROCEDURE_NAMES = {
   1: 'Centrifuge',
@@ -60,6 +91,17 @@ function formatNum(v, decimals = 3) {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
+}
+
+// Format a model-input feature for display: returns { num, unit } where `num`
+// is the value rounded per FEATURE_META (or '—' if missing/NaN) and `unit` is
+// the suffix to show beside it (hidden when the value is missing).
+function formatFeatureValue(name, value) {
+  const meta = FEATURE_META[name] || {};
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return { num: '—', unit: '' };
+  }
+  return { num: formatNum(value, meta.decimals ?? 3), unit: meta.unit ?? '' };
 }
 
 /** Fixed-height slot — inner content swaps without resizing the shell. */
@@ -634,36 +676,47 @@ export default function StreamingDashboard() {
             </div>
           </Panel>
 
-          <Panel title="Features sent to the model (8)" icon={Layers}>
+          <Panel title="Model inputs (4)" icon={Layers}>
             <div className="rounded-lg border border-slate-100 overflow-hidden">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="bg-slate-50 text-slate-500 uppercase tracking-wide border-b border-slate-100">
-                    <th className="text-left py-2 px-3 font-medium w-[40%]">Feature</th>
+                    <th className="text-left py-2 px-3 font-medium w-[55%]">Feature</th>
                     <th className="text-right py-2 px-3 font-medium">Value</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {FEATURE_ORDER.map((name) => (
-                    <tr key={name} className="border-b border-slate-50 hover:bg-slate-50/50">
-                      <td className="py-2 px-3 font-mono text-slate-600">{name}</td>
-                      <td className="py-2 px-3 font-mono text-right tabular-nums text-slate-900 font-semibold min-w-[120px]">
-                        {pred?.feature_values?.[name] !== undefined
-                          ? String(pred.feature_values[name])
-                          : name === 'procedure_id' && sessionContext.procedureId != null
-                            ? String(sessionContext.procedureId)
-                            : name === 'step_number' && sessionContext.stepNumber != null
-                              ? String(sessionContext.stepNumber)
-                              : name === 'cumulative_session_time_s' &&
-                                  sessionContext.cumulativeSessionTimeS != null
-                                ? String(formatNum(sessionContext.cumulativeSessionTimeS, 3))
-                                : '—'}
-                      </td>
-                    </tr>
-                  ))}
+                  {FEATURE_ORDER.map((name) => {
+                    const meta = FEATURE_META[name] || {};
+                    const { num, unit } = formatFeatureValue(name, pred?.feature_values?.[name]);
+                    return (
+                      <tr key={name} className="border-b border-slate-50 hover:bg-slate-50/50">
+                        <td className="py-2 px-3 text-slate-600">
+                          <span
+                            title={meta.desc}
+                            className="font-mono cursor-help border-b border-dotted border-slate-300"
+                          >
+                            {name}
+                          </span>
+                          {meta.window ? (
+                            <span className="ml-1 text-[9px] text-slate-400">({meta.window})</span>
+                          ) : null}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-right tabular-nums text-slate-900 font-semibold min-w-[120px]">
+                          {num}
+                          {num !== '—' && unit ? (
+                            <span className="ml-1 text-[10px] font-normal text-slate-400">{unit}</span>
+                          ) : null}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
+            <p className="mt-2 text-[10px] leading-snug text-slate-400">
+              Showing raw live values; the model receives these clipped to the training range.
+            </p>
           </Panel>
         </div>
       </div>

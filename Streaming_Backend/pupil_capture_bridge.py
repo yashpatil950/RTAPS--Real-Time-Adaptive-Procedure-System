@@ -78,6 +78,9 @@ class BridgeContext:
     backend_url: str
     headers: dict[str, str]
     session: requests.Session
+    # Pupil clock timestamp of the last blink we forwarded — used to debounce
+    # builds that emit untyped onset/offset pairs (see `_handle_blink`).
+    last_blink_t: float = -1.0
 
 
 def _unpack_payload(payload_raw: bytes) -> dict[str, Any]:
@@ -212,12 +215,49 @@ class PupilBatcher:
         _post(self._ctx, "/stream/pupil", {"stream_id": self._ctx.stream_id, "samples": batch})
 
 
+# Min gap (Pupil clock seconds) between two forwarded blinks when the events
+# carry no `type` tag — long enough to swallow an untyped onset/offset pair,
+# short enough to keep genuinely separate blinks (typical inter-blink interval
+# is seconds, far above this).
+_BLINK_MIN_INTERVAL_S = 0.4
+
+
 def _handle_blink(ctx: BridgeContext, payload: dict[str, Any]) -> None:
+    """Forward exactly one backend blink per physical blink.
+
+    Pupil Capture's Online Blink Detector publishes TWO messages per blink on
+    the `blink`/`blinks` topic — an `onset` (blink start) and an `offset`
+    (blink end) — each as its own ZMQ event. Forwarding both made the backend
+    count a single blink twice: the UI "Blinks" tile jumped by ~2 per blink and
+    the `blink_rate_30s` model feature ran at ~2x its training scale. (This is
+    the same multi-emit behaviour that `session_state.add_fixations` already
+    collapses for the Online Fixation Detector.)
+
+    We count each blink once, at its `onset` — whose `timestamp` is the blink
+    start that the backend's `BlinkEvent.start_timestamp` documents. Builds that
+    don't tag events with `type` fall back to a short debounce so a double-emit
+    can't slip through.
+    """
+    blink_type = payload.get("type")
+    if isinstance(blink_type, bytes):
+        blink_type = blink_type.decode("utf-8", errors="replace")
+    if blink_type == "offset":
+        return  # the matching `onset` already counted this blink
+
+    start_ts = float(payload.get("timestamp", time.time()))
+    if (
+        blink_type != "onset"
+        and ctx.last_blink_t >= 0
+        and (start_ts - ctx.last_blink_t) < _BLINK_MIN_INTERVAL_S
+    ):
+        return  # untyped event within debounce window — same physical blink
+
+    ctx.last_blink_t = start_ts
     body = {
         "stream_id": ctx.stream_id,
         "blinks": [
             {
-                "start_timestamp": float(payload.get("timestamp", time.time())),
+                "start_timestamp": start_ts,
                 "duration": float(payload.get("duration", 0.0)),
                 "confidence": float(payload.get("confidence", 1.0)),
             }

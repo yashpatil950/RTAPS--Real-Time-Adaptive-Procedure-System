@@ -108,24 +108,28 @@ data/_processed/
 
 ## 4. Features (X) — the 4 numbers the model sees
 
-The order **must** match `FEATURE_NAMES` in `Streaming_Backend/app/feature_extractor.py`:
+Every second the backend turns the operator's recent eye data into exactly **4 numbers**. Each one is a *summary statistic over a rolling look-back window* — not an instantaneous reading. The order **must** match `FEATURE_NAMES` in `Streaming_Backend/app/feature_extractor.py`.
 
-| \# | Feature | Window | What it measures (plain English) |
-| --- | --- | --- | --- |
-| 1 | `pupil_pcps_mean` | 10 s | How much the pupil has dilated/constricted compared to the operator's resting baseline. Bigger = more mental effort. |
-| 2 | `pupil_diam_slope` | 10 s | Is the pupil getting bigger or smaller right now? (slope of diameter over the last 10 s) |
-| 3 | `blink_rate_30s` | 30 s | Number of (real, non-tracking-loss) blinks in the last 30 s. Cognitive load tends to **suppress** blinking, so high workload usually = fewer blinks. |
-| 4 | `fixation_dur_mean_ms` | 30 s | Average length of each fixation (the periods when the eyes are still). Longer fixations = deeper processing. |
+| \# | Feature | Unit | Window | What it is & how it's computed |
+| --- | --- | --- | --- | --- |
+| 1 | `pupil_pcps_mean` | fraction (ratio, unitless) | last 10 s | "Percent change in pupil size." For every pupil sample in the window, compute `(diameter − baseline) / baseline` (per eye, using that operator's calm baseline), then average across all samples. `0.05` = pupil is 5 % larger than baseline. Bigger = more mental effort. |
+| 2 | `pupil_diam_slope` | mm / second | last 10 s | Slope of a straight line fit through pupil diameter (mm) vs. time (s). Positive = dilating, negative = constricting. Captures the *trend*, not the average. |
+| 3 | `blink_rate_30s` | count (integer) | last 30 s | Number of (non-tracking-loss) blinks whose onset falls in the window. Despite the name "rate", it is a raw **count**, not per-minute. Cognitive load suppresses blinking, so fewer blinks ≈ higher load. |
+| 4 | `fixation_dur_mean_ms` | milliseconds | last 30 s | Mean duration of the fixations (periods when the eye is still) in the window, ×1000 to convert s→ms. Longer fixations = deeper visual processing. |
 
 (`fixation_dispersion_mean` was removed — it added little accuracy and correlated with `fixation_dur_mean_ms`.)
 
-**Why different windows per feature?** Pupil samples are dense (120 Hz), so 10 s gives a stable mean. Blinks and fixations are sparse — a 10 s slice often contains 0 or 1 events, which is too noisy. 30 s smooths them out without losing responsiveness.
+> **Worked example — what does a fixation value of `300` mean?** That's `fixation_dur_mean_ms ≈ 300`: over the **last 30 seconds** the operator's fixations lasted **300 ms (0.3 s) on average**. It's an average over the 30 s window, recomputed every second (normal fixations run 150–300 ms). Likewise `blink_rate_30s = 3` means *3 blinks in the last 30 s*, and `pupil_pcps_mean = 0.05` means *pupil 5 % above baseline*.
 
-**Predictions are still emitted every 1 s** — only the buffer slice differs per feature.
+The exact formulas live in `Streaming_Backend/app/feature_extractor.py::extract_features` and mirror the offline training code in `scripts/lib/{pupil,blink,fixation}_features.py`, so live and training-time values are comparable.
 
-### What was deliberately left out
+**Why different windows per feature?** Pupil samples are dense (~120 Hz), so 10 s gives a stable mean and slope. Blinks and fixations are sparse *events* — a 10 s slice often contains 0–1 of them, which is too noisy — so they use a 30 s window. **Predictions are still emitted every 1 s** (the stride); only the look-back window differs per feature.
 
-`procedure_id`, `step_number`, `cumulative_session_time_s`. These would let the model learn "step 5 of centrifuge is always high" without ever looking at the eyes. v4 forces it to use sensors.
+**On the dashboard** the live "Model inputs" table shows the **raw** computed value (e.g. `300 ms`); the model actually receives that value **clipped** to the training range (see §9), so the two differ only when a live value runs outside the training envelope.
+
+### What was deliberately left out — `procedure_id`, `step_number`, `cumulative_session_time_s`
+
+The model is given **none** of these. `procedure_id` / `step_number` would let it cheat by reciting the per-step VACP table instead of reading the eyes (full explanation in §6, *"Why there's no step feature in X"*); `cumulative_session_time_s` was tested and *overfit* to each session's pacing, hurting accuracy on unseen operators. So the model is forced to use physiology only.
 
 ---
 
@@ -203,6 +207,25 @@ Result on the current Y labels:
 Every 1 s window inside a step inherits the step's label. At the window level the class balance is much better: **8 314 low / 9 906 high**(54 % high / 46 % low across 18 220 valid windows).
 
 **All labels come from the user's hand-curated VACP analysis — no proxy, no synthetic data.**
+
+### How each 1-second window gets its label — the timestamp link
+
+X (eye features) and Y (workload class) come from two completely different processes — eye-tracking vs. a hand-filled VACP workbook — so how do they line up against each other? Through **timestamps and the step**:
+
+1. **Each X window has a decision timestamp `t`** on the eye-tracker clock, computed from the eye data in `[t − window, t]` (`04_extract_features_window.py`).
+2. **Each step is a time interval.** `03_align_steps.py` takes the RTAPS UI log (how long the operator spent on each step), lays the steps end-to-end from session start, and converts them to `[start, end]` intervals on the *same* eye-tracker clock (`step_boundaries.parquet`).
+3. **Stamp the step onto the window by timestamp containment.** Stage 04 assigns each window to the step whose interval contains `t` (a `np.searchsorted` over the step start times), writing `procedure_id` + `step_number` onto the row.
+4. **The window inherits that step's VACP label.** At training time (`07d_train_rf_tuned.py::_attach_labels`) the windows are left-joined to the per-step label table **on `(procedure_id, step_number)`**, so every 1 s window receives the `low`/`high` of the step it fell inside.
+
+So the chain is: **timestamp → which step was active at that instant → that step's VACP workload label.** X is *"what the eyes did during second `t`"*; Y is *"how demanding the step that second `t` belonged to was."* They meet at the step, located by the timestamp.
+
+### Why there's no `step_number` (or `procedure_id`) *feature* in X
+
+Notice the step is used to **build and align** the labels (points 3–4 above) — but it is then **dropped before training**: `FEATURE_COLS` contains only the 4 sensor features. That is deliberate, and it's the most important design decision here.
+
+The label is **derived from** `(procedure_id, step_number)` — it literally *is* `f(step)`. If we also fed those in as model inputs, the optimal thing for the model to do is memorise the lookup ("Centrifuge step 5 → high") and ignore the eyes entirely. We measured exactly this: adding `step_number` + `procedure_id` shoots accuracy to **~99 %**, but the four eye features collapse to **0 importance** — the model is just reciting the VACP spreadsheet, not detecting workload, and it would not generalise to a new or re-ordered procedure.
+
+So the step is the **annotator's tool** (like the knowledge a human labeller uses when tagging a photo "cat") — used to *create* the labels, not a clue handed to the model. Removing it forces the model to learn the genuine **`eyes → workload`** relationship. The price is lower headline accuracy; the reward is a model that actually reads physiology and transfers to unseen procedures and operators.
 
 ### UI rendering rule
 

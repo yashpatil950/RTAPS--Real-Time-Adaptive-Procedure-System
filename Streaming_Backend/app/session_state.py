@@ -375,14 +375,21 @@ class SessionState:
         # a given fixation carries the most complete values, so we
         # overwrite earlier partial-state records. Net result: one record
         # per real fixation — same shape as the training data.
+        new = 0
         for f in fixations:
             # Re-insert (pop + set) so the dict's insertion order tracks
             # *latest* arrival rather than the first one. That keeps the
             # head-trim correct (oldest fixation onset gets evicted first).
-            self._fixations.pop(f.t, None)
+            if self._fixations.pop(f.t, None) is None:
+                new += 1  # first emit seen for this fixation onset
             self._fixations[f.t] = f
         n = len(fixations)
-        self.fixations_received_total += n
+        # Count DISTINCT fixations (new onsets), not the Online Fixation
+        # Detector's progressive re-emits of the same fixation. This keeps
+        # `fixations_received_total` on the one-per-fixation scale of the
+        # training data and consistent with `blinks_received_total` (the raw
+        # ZMQ emit rate is still visible in the bridge's own 30 s summary log).
+        self.fixations_received_total += new
         if n:
             self.last_fixation_received_at = time.time()
         # Hard cap to bound memory under bizarre conditions (e.g. clock
