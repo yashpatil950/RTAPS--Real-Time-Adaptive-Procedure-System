@@ -209,16 +209,39 @@ const SessionView = () => {
 
         setLatestPrediction(data);
         setStepWorkloadStates((prev) => {
-          const cur = prev[step.id] || { current: 'low', reachedHigh: false };
+          const cur =
+            prev[step.id] || {
+              current: 'low',
+              reachedHigh: false,
+              reachedHighAtMs: null,
+              maxHighProba: 0,
+              highCount: 0,
+              predCount: 0,
+            };
+          const isHigh = label === 'high';
           // Latch on the first "high" for this step; never clear it
           // until the step ends (whereupon the entry is dropped because
-          // a fresh step starts with no key in this dict).
-          const reachedHigh = cur.reachedHigh || label === 'high';
+          // a fresh step starts with no key in this dict). We also record
+          // WHEN the latch first fired (reachedHighAtMs) and running
+          // counts so the completed-session analytics record can report
+          // whether the adaptation triggered, how far into the step, and
+          // how strong/sustained the high-workload signal was.
+          const reachedHigh = cur.reachedHigh || isHigh;
+          const reachedHighAtMs = cur.reachedHighAtMs || (isHigh ? Date.now() : null);
+          const pHigh =
+            data.workload_proba && typeof data.workload_proba.high === 'number'
+              ? data.workload_proba.high
+              : null;
           return {
             ...prev,
             [step.id]: {
               current: label,
               reachedHigh,
+              reachedHighAtMs,
+              maxHighProba:
+                pHigh != null ? Math.max(cur.maxHighProba || 0, pHigh) : cur.maxHighProba,
+              highCount: (cur.highCount || 0) + (isHigh ? 1 : 0),
+              predCount: (cur.predCount || 0) + 1,
               proba: data.workload_proba || null,
               decisionTime: data.decision_time || null,
               rawLabel: data.raw_workload_label || null,
@@ -292,13 +315,37 @@ const SessionView = () => {
             const totalTimeSec = sessionStartTime == null
               ? 0
               : Math.floor((end - sessionStartTime) / 1000) + devExtraSeconds;
-            const stepSummaries = procedure.steps.map((s) => ({
-              stepId: s.id,
-              stepNumber: s.stepNumber,
-              timeSpentSec: (stepTimes[s.id] || 0),
-              exceededThreshold: (stepTimes[s.id] || 0) > s.timeThreshold,
-              subStepsShown: (stepTimes[s.id] || 0) > s.timeThreshold && s.subSteps && s.subSteps.length > 0,
-            }));
+            const stepSummaries = procedure.steps.map((s) => {
+              const wl = stepWorkloadStates[s.id] || {};
+              const startMs = stepStartTimes[s.id] ? stepStartTimes[s.id].getTime() : null;
+              // Seconds from when the operator entered the step to when the
+              // model first reported "high" (i.e. when guidance was revealed).
+              const timeToAdaptationSec =
+                wl.reachedHighAtMs && startMs
+                  ? Math.max(0, Math.round((wl.reachedHighAtMs - startMs) / 1000))
+                  : null;
+              return {
+                stepId: s.id,
+                stepNumber: s.stepNumber,
+                stepTitle: s.title || null,
+                timeSpentSec: (stepTimes[s.id] || 0),
+                // Legacy time-threshold proxy — kept for backward compatibility
+                // with sessions recorded before workload-driven adaptation.
+                exceededThreshold: (stepTimes[s.id] || 0) > s.timeThreshold,
+                subStepsShown: (stepTimes[s.id] || 0) > s.timeThreshold && s.subSteps && s.subSteps.length > 0,
+                // ML workload-driven adaptation — what the operator actually saw.
+                workloadReachedHigh: !!wl.reachedHigh,
+                adaptationShown: !!wl.reachedHigh,
+                finalWorkloadLevel: wl.current || (wl.reachedHigh ? 'high' : 'low'),
+                timeToAdaptationSec,
+                maxHighProba:
+                  typeof wl.maxHighProba === 'number' ? Number(wl.maxHighProba.toFixed(3)) : null,
+                highPredictionCount: wl.highCount || 0,
+                predictionCount: wl.predCount || 0,
+              };
+            });
+            const stepsWithAdaptation = stepSummaries.filter((x) => x.adaptationShown).length;
+            const stepsWithPredictions = stepSummaries.filter((x) => x.predictionCount > 0).length;
             // Get current user data
             const currentUser = JSON.parse(localStorage.getItem('currentParticipant') || '{}');
             
@@ -316,6 +363,13 @@ const SessionView = () => {
               totalTimeSec,
               steps: stepSummaries,
               trainNumber: trainNumber,
+              metadata: {
+                // Session-level adaptation summary for the Analytics page.
+                adaptationMode: streamingEnabled ? 'workload' : 'time',
+                stepsWithAdaptation,
+                stepsWithPredictions,
+                totalSteps: stepSummaries.length,
+              },
             }).catch(error => {
               console.error('Failed to save session to API:', error);
             });

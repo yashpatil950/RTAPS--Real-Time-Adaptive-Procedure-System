@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { getSummary, loadAnalytics, getAllParticipants } from '../data/analyticsStorage';
-import { Activity, Timer, ListChecks, Info, Download } from 'lucide-react';
+import { Activity, Timer, ListChecks, Info, Download, ChevronRight, Lightbulb } from 'lucide-react';
 import { procedures } from '../data/procedures';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 
@@ -34,6 +34,24 @@ const getCompletedAtMs = (s) => {
   }
   return 0;
 };
+
+// Did the ML model flag high workload on this step (so adaptive guidance was
+// revealed)? Prefer the workload fields recorded by the live system; fall back
+// to the legacy time-threshold proxy for sessions saved before workload-driven
+// adaptation existed.
+const stepAdapted = (st) => {
+  if (typeof st.adaptationShown === 'boolean') return st.adaptationShown;
+  if (typeof st.workloadReachedHigh === 'boolean') return st.workloadReachedHigh;
+  return !!st.subStepsShown;
+};
+
+const WORKLOAD_BADGE = {
+  high: 'bg-orange-100 text-orange-800',
+  medium: 'bg-yellow-100 text-yellow-800',
+  low: 'bg-green-100 text-green-800',
+};
+
+const secOrDash = (v) => (v == null ? '—' : `${v}s`);
 
 const Analytics = () => {
   const [currentUser, setCurrentUser] = useState(null);
@@ -135,37 +153,79 @@ const Analytics = () => {
       .map(([stepNumber, v]) => ({ step: `Step ${stepNumber}`, seconds: v.count ? Math.round(v.total / v.count) : 0 }));
   }, [selectedSessions, selectedProcedureId]);
 
-  const exceedRateByStepData = useMemo(() => {
+  // Per-step rate at which the ML model flagged high workload (and adaptive
+  // guidance was shown). This is the workload-driven view; the legacy
+  // time-threshold rate is still available per-step via stepAdapted's fallback.
+  const adaptationRateByStepData = useMemo(() => {
     if (selectedProcedureId === 'all') return [];
     const sessions = selectedSessions.filter((s) => s.procedureId === Number(selectedProcedureId));
     const stepsMap = new Map();
     sessions.forEach((s) => {
       (s.steps || []).forEach((st) => {
         const key = st.stepNumber;
-        const cur = stepsMap.get(key) || { exceed: 0, count: 0 };
+        const cur = stepsMap.get(key) || { adapted: 0, count: 0 };
         cur.count += 1;
-        if (st.exceededThreshold) cur.exceed += 1;
+        if (stepAdapted(st)) cur.adapted += 1;
         stepsMap.set(key, cur);
       });
     });
     return Array.from(stepsMap.entries())
       .sort((a, b) => a[0] - b[0])
-      .map(([stepNumber, v]) => ({ step: `Step ${stepNumber}`, rate: v.count ? Math.round((100 * v.exceed) / v.count) : 0 }));
+      .map(([stepNumber, v]) => ({ step: `Step ${stepNumber}`, rate: v.count ? Math.round((100 * v.adapted) / v.count) : 0 }));
   }, [selectedSessions, selectedProcedureId]);
 
+  // Sessions the operator can expand to see a per-step workload/time breakdown.
+  const [expandedSessionIds, setExpandedSessionIds] = useState(new Set());
+  const toggleSessionExpanded = (key) => {
+    setExpandedSessionIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+
+  // Overall adaptation rate across the currently filtered sessions: of all the
+  // steps performed, what fraction triggered high-workload adaptive guidance.
+  const adaptationOverall = useMemo(() => {
+    let steps = 0;
+    let adapted = 0;
+    filteredSessions.forEach((s) => {
+      (s.steps || []).forEach((st) => {
+        steps += 1;
+        if (stepAdapted(st)) adapted += 1;
+      });
+    });
+    return { steps, adapted, ratePct: steps ? Math.round((100 * adapted) / steps) : 0 };
+  }, [filteredSessions]);
+
   const handleExportCSV = () => {
-    const headers = ['SessionId', 'CompletedAt', 'Procedure', 'Train', 'TotalTimeSec', 'StepNumber', 'TimeSpentSec', 'ExceededThreshold', 'SubStepsShown'];
+    const headers = [
+      'SessionId', 'CompletedAt', 'Participant', 'Procedure', 'Train', 'TotalTimeSec',
+      'StepNumber', 'StepTitle', 'TimeSpentSec',
+      'WorkloadHigh', 'AdaptationShown', 'FinalWorkloadLevel', 'TimeToAdaptationSec',
+      'MaxHighProba', 'HighPredictionCount', 'PredictionCount',
+      'ExceededThreshold(legacy)', 'SubStepsShown(legacy)',
+    ];
     const rows = [];
     selectedSessions.forEach((s) => {
       (s.steps || []).forEach((st) => {
         rows.push([
           s.id || s.sessionId,
           new Date(getCompletedAtMs(s)).toISOString(),
+          s.participantUsername || s.participantId || '',
           s.procedureName || getProcedureName(s.procedureId),
           s.trainNumber ? `Train ${s.trainNumber}` : 'N/A',
           s.totalTimeSec || 0,
           st.stepNumber,
+          (st.stepTitle || '').replace(/,/g, ' '),
           st.timeSpentSec || 0,
+          st.workloadReachedHigh ? 'yes' : 'no',
+          stepAdapted(st) ? 'yes' : 'no',
+          st.finalWorkloadLevel || '',
+          st.timeToAdaptationSec == null ? '' : st.timeToAdaptationSec,
+          st.maxHighProba == null ? '' : st.maxHighProba,
+          st.highPredictionCount == null ? '' : st.highPredictionCount,
+          st.predictionCount == null ? '' : st.predictionCount,
           st.exceededThreshold ? 'yes' : 'no',
           st.subStepsShown ? 'yes' : 'no',
         ]);
@@ -285,7 +345,7 @@ const Analytics = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="bg-white rounded-lg shadow p-6 text-center">
           <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center mx-auto mb-3">
             <Activity className="w-6 h-6 text-blue-600" />
@@ -307,6 +367,14 @@ const Analytics = () => {
           <h3 className="text-lg font-semibold text-gray-900">{Object.keys(summary.byProcedure || {}).length}</h3>
           <p className="text-gray-600">Procedures Types Used</p>
         </div>
+        <div className="bg-white rounded-lg shadow p-6 text-center">
+          <div className="w-12 h-12 bg-orange-100 rounded-lg flex items-center justify-center mx-auto mb-3">
+            <Lightbulb className="w-6 h-6 text-orange-600" />
+          </div>
+          <h3 className="text-lg font-semibold text-gray-900">{adaptationOverall.ratePct}%</h3>
+          <p className="text-gray-600">High-Workload Adaptation Rate</p>
+          <p className="text-xs text-gray-400 mt-1">{adaptationOverall.adapted} / {adaptationOverall.steps} steps (filtered)</p>
+        </div>
       </div>
 
       {selectedProcedureId !== 'all' && (
@@ -326,18 +394,22 @@ const Analytics = () => {
             </div>
           </div>
           <div className="bg-white rounded-lg shadow p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-3">Threshold Exceed Rate by Step(%)</h3>
+            <h3 className="text-lg font-semibold text-gray-900 mb-3">High-Workload Adaptation Rate by Step(%)</h3>
             <div className="h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={exceedRateByStepData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                <BarChart data={adaptationRateByStepData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="step" />
                   <YAxis unit="%" />
                   <Tooltip formatter={(v) => `${v}%`} />
-                  <Bar dataKey="rate" fill="#a855f7" />
+                  <Bar dataKey="rate" fill="#f97316" />
                 </BarChart>
               </ResponsiveContainer>
             </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Percent of sessions where the model flagged <span className="font-medium text-orange-700">high workload</span> on
+              this step and adaptive guidance was shown.
+            </p>
           </div>
         </div>
       )}
@@ -387,13 +459,13 @@ const Analytics = () => {
                   </th>
                   <th className="py-2 pr-16">
                     <div className="relative inline-flex items-center space-x-1 group cursor-default">
-                      <span>Guidance Rate</span>
+                      <span>Adaptations</span>
                       <Info className="w-4 h-4 text-gray-400" />
                       <span
                         role="tooltip"
                         className="invisible group-hover:visible absolute left-0 top-full mt-2 w-72 text-xs text-gray-800 bg-white border border-gray-200 rounded-md shadow p-2 z-10"
                       >
-                        Percentage of main steps where additional guidance (sub-steps) appeared because the user exceeded the step’s time threshold.
+                        Main steps where the ML model flagged high workload and adaptive guidance was shown, out of total steps. Expand a row for the per-step breakdown.
                       </span>
                     </div>
                   </th>
@@ -401,46 +473,119 @@ const Analytics = () => {
               </thead>
               <tbody>
                 {paginatedSessions.map((s) => {
-                  const guidanceCount = (s.steps || []).filter((x) => x.subStepsShown).length;
-                  const guidanceRate = (s.steps && s.steps.length) ? Math.round((100 * guidanceCount) / s.steps.length) : 0;
+                  const key = s.id || s.sessionId;
+                  const steps = s.steps || [];
+                  const guidanceCount = steps.filter((x) => stepAdapted(x)).length;
+                  const guidanceRate = steps.length ? Math.round((100 * guidanceCount) / steps.length) : 0;
+                  const isExpanded = expandedSessionIds.has(key);
+                  const colCount = isAdmin ? 8 : 7;
                   return (
-                    <tr key={s.id || s.sessionId} className="border-t border-gray-200">
-                      <td className="py-2 pr-4">
-                        <input
-                          type="checkbox"
-                          checked={selectedSessionIds.has(s.id || s.sessionId)}
-                          onChange={(e) => {
-                            setSelectedSessionIds((prev) => {
-                              const next = new Set(prev);
-                              const key = s.id || s.sessionId;
-                              if (e.target.checked) next.add(key); else next.delete(key);
-                              return next;
-                            });
-                          }}
-                        />
-                      </td>
-                      <td className="py-2 pr-4 text-gray-700">{new Date(getCompletedAtMs(s)).toLocaleString()}</td>
-                      {isAdmin && (
-                        <td className="py-2 pr-4 text-gray-700 truncate">
-                          <span className="inline-flex max-w-[8rem] items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 truncate">
-                            {s.participantUsername || s.participantId || 'Unknown'}
-                          </span>
+                    <React.Fragment key={key}>
+                      <tr className="border-t border-gray-200">
+                        <td className="py-2 pr-4">
+                          <input
+                            type="checkbox"
+                            checked={selectedSessionIds.has(key)}
+                            onChange={(e) => {
+                              setSelectedSessionIds((prev) => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(key); else next.delete(key);
+                                return next;
+                              });
+                            }}
+                          />
                         </td>
-                      )}
-                      <td className="py-2 pr-4 text-gray-700">{s.procedureName || getProcedureName(s.procedureId)}</td>
-                      <td className="py-2 pr-4 text-gray-700">
-                        {s.trainNumber ? (
-                          <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
-                            Train {s.trainNumber}
-                          </span>
-                        ) : (
-                          <span className="text-gray-400 text-xs">N/A</span>
+                        <td className="py-2 pr-4 text-gray-700">
+                          <button
+                            type="button"
+                            onClick={() => toggleSessionExpanded(key)}
+                            className="inline-flex items-center gap-1 hover:text-blue-700"
+                            aria-expanded={isExpanded}
+                            title="Show per-step breakdown"
+                          >
+                            <ChevronRight className={`w-4 h-4 text-gray-400 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
+                            <span>{new Date(getCompletedAtMs(s)).toLocaleString()}</span>
+                          </button>
+                        </td>
+                        {isAdmin && (
+                          <td className="py-2 pr-4 text-gray-700 truncate">
+                            <span className="inline-flex max-w-[8rem] items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 truncate">
+                              {s.participantUsername || s.participantId || 'Unknown'}
+                            </span>
+                          </td>
                         )}
-                      </td>
-                      <td className="py-2 pr-4 text-gray-700">{formatTime(s.totalTimeSec || 0)}</td>
-                      <td className="py-2 pr-4 text-gray-700">{(s.steps || []).length}</td>
-                      <td className="py-2 pr-4 text-gray-700">{guidanceRate}%</td>
-                    </tr>
+                        <td className="py-2 pr-4 text-gray-700">{s.procedureName || getProcedureName(s.procedureId)}</td>
+                        <td className="py-2 pr-4 text-gray-700">
+                          {s.trainNumber ? (
+                            <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                              Train {s.trainNumber}
+                            </span>
+                          ) : (
+                            <span className="text-gray-400 text-xs">N/A</span>
+                          )}
+                        </td>
+                        <td className="py-2 pr-4 text-gray-700">{formatTime(s.totalTimeSec || 0)}</td>
+                        <td className="py-2 pr-4 text-gray-700">{steps.length}</td>
+                        <td className="py-2 pr-4 text-gray-700">
+                          <span className={`font-medium ${guidanceCount > 0 ? 'text-orange-700' : 'text-gray-500'}`}>
+                            {guidanceCount}/{steps.length}
+                          </span>
+                          <span className="text-gray-400 text-xs ml-1">({guidanceRate}%)</span>
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr className="bg-gray-50 border-t border-gray-100">
+                          <td className="py-3 px-4" colSpan={colCount}>
+                            {steps.length === 0 ? (
+                              <div className="text-xs text-gray-500">No step detail recorded for this session.</div>
+                            ) : (
+                              <table className="w-full text-xs">
+                                <thead>
+                                  <tr className="text-gray-500">
+                                    <th className="text-left py-1 pr-4">Step</th>
+                                    <th className="text-left py-1 pr-4">Title</th>
+                                    <th className="text-left py-1 pr-4">Time</th>
+                                    <th className="text-left py-1 pr-4">Workload</th>
+                                    <th className="text-left py-1 pr-4">Adapted</th>
+                                    <th className="text-left py-1 pr-4">Time → adaptation</th>
+                                    <th className="text-left py-1 pr-4">Peak P(high)</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {steps.slice().sort((a, b) => (a.stepNumber || 0) - (b.stepNumber || 0)).map((st) => {
+                                    const adapted = stepAdapted(st);
+                                    const lvl = st.finalWorkloadLevel || (st.workloadReachedHigh ? 'high' : 'low');
+                                    return (
+                                      <tr key={st.stepId || st.stepNumber} className="border-t border-gray-200">
+                                        <td className="py-1 pr-4 text-gray-700">Step {st.stepNumber}</td>
+                                        <td className="py-1 pr-4 text-gray-600 max-w-[16rem] truncate">{st.stepTitle || '—'}</td>
+                                        <td className="py-1 pr-4 text-gray-700">{formatTime(st.timeSpentSec || 0)}</td>
+                                        <td className="py-1 pr-4">
+                                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full font-medium ${WORKLOAD_BADGE[lvl] || WORKLOAD_BADGE.low}`}>
+                                            {lvl}
+                                          </span>
+                                        </td>
+                                        <td className="py-1 pr-4">
+                                          {adapted ? (
+                                            <span className="text-orange-700 font-medium">Yes</span>
+                                          ) : (
+                                            <span className="text-gray-400">No</span>
+                                          )}
+                                        </td>
+                                        <td className="py-1 pr-4 text-gray-700">{secOrDash(st.timeToAdaptationSec)}</td>
+                                        <td className="py-1 pr-4 text-gray-700">
+                                          {st.maxHighProba == null ? '—' : `${Math.round(st.maxHighProba * 100)}%`}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </tbody>
