@@ -139,6 +139,8 @@ const LandingPage = () => {
 
   const handleAdminAccess = () => {
     const adminData = {
+      id: 'admin',
+      username: 'Administrator',
       role: 'admin',
       accessedAt: new Date().toISOString()
     };

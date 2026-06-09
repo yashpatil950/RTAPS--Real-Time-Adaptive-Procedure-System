@@ -53,6 +53,46 @@ const WORKLOAD_BADGE = {
 
 const secOrDash = (v) => (v == null ? '—' : `${v}s`);
 
+// Aggregate per-second workload from a session's steps. The live system records
+// `highPredictionCount` (seconds the displayed workload was "high") and
+// `predictionCount` (total seconds a prediction was produced, ~1 per second)
+// per step, so summing them across steps gives time-in-high and time-in-low.
+const sessionWorkload = (s) => {
+  let highSec = 0;
+  let totalSec = 0;
+  (s.steps || []).forEach((st) => {
+    highSec += st.highPredictionCount || 0;
+    totalSec += st.predictionCount || 0;
+  });
+  const lowSec = Math.max(0, totalSec - highSec);
+  return {
+    highSec,
+    lowSec,
+    totalSec,
+    pctHigh: totalSec ? Math.round((100 * highSec) / totalSec) : null,
+    pctLow: totalSec ? Math.round((100 * lowSec) / totalSec) : null,
+    hasData: totalSec > 0,
+  };
+};
+
+// Small inline high/low split bar used in the sessions table.
+const WorkloadSplitBar = ({ wl }) => {
+  if (!wl.hasData) return <span className="text-gray-400 text-xs">N/A</span>;
+  return (
+    <div className="min-w-[11rem]">
+      <div className="flex h-2 w-full rounded overflow-hidden bg-gray-100">
+        <div className="bg-orange-400" style={{ width: `${wl.pctHigh}%` }} />
+        <div className="bg-green-400 flex-1" />
+      </div>
+      <div className="text-xs text-gray-600 mt-1 whitespace-nowrap">
+        <span className="text-orange-700 font-medium">{wl.highSec}s high ({wl.pctHigh}%)</span>
+        <span className="text-gray-400"> · </span>
+        <span className="text-green-700">{wl.lowSec}s low ({wl.pctLow}%)</span>
+      </div>
+    </div>
+  );
+};
+
 const Analytics = () => {
   const [currentUser, setCurrentUser] = useState(null);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -103,6 +143,20 @@ const Analytics = () => {
   const [selectedProcedureId, setSelectedProcedureId] = useState('all');
   const [selectedRange, setSelectedRange] = useState('all');
   const [selectedUserId, setSelectedUserId] = useState('all');
+
+  // Resolve a session's participant name. Regular users always carry an id and
+  // username; the admin's own sessions historically lacked both, which showed
+  // as "Unknown". Fall back through the participants list and finally to
+  // "Administrator" (a session with no participant id can only be the admin's).
+  const participantNameById = useMemo(() => {
+    const m = {};
+    (participants || []).forEach((u) => {
+      if (u && u.id != null) m[u.id] = u.username;
+    });
+    return m;
+  }, [participants]);
+  const resolveParticipant = (s) =>
+    s.participantUsername || participantNameById[s.participantId] || s.participantId || 'Administrator';
 
   const filteredSessions = useMemo(() => {
     const now = Date.now();
@@ -174,6 +228,27 @@ const Analytics = () => {
       .map(([stepNumber, v]) => ({ step: `Step ${stepNumber}`, rate: v.count ? Math.round((100 * v.adapted) / v.count) : 0 }));
   }, [selectedSessions, selectedProcedureId]);
 
+  // Average share of time spent in HIGH workload, per step, across the selected
+  // sessions. Uses the per-second prediction counts rather than the latch, so it
+  // reflects how much of each step was actually spent at high workload.
+  const highTimeShareByStepData = useMemo(() => {
+    if (selectedProcedureId === 'all') return [];
+    const sessions = selectedSessions.filter((s) => s.procedureId === Number(selectedProcedureId));
+    const stepsMap = new Map();
+    sessions.forEach((s) => {
+      (s.steps || []).forEach((st) => {
+        const key = st.stepNumber;
+        const cur = stepsMap.get(key) || { high: 0, total: 0 };
+        cur.high += st.highPredictionCount || 0;
+        cur.total += st.predictionCount || 0;
+        stepsMap.set(key, cur);
+      });
+    });
+    return Array.from(stepsMap.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([stepNumber, v]) => ({ step: `Step ${stepNumber}`, share: v.total ? Math.round((100 * v.high) / v.total) : 0 }));
+  }, [selectedSessions, selectedProcedureId]);
+
   // Sessions the operator can expand to see a per-step workload/time breakdown.
   const [expandedSessionIds, setExpandedSessionIds] = useState(new Set());
   const toggleSessionExpanded = (key) => {
@@ -198,21 +273,45 @@ const Analytics = () => {
     return { steps, adapted, ratePct: steps ? Math.round((100 * adapted) / steps) : 0 };
   }, [filteredSessions]);
 
+  // Overall time-in-high vs time-in-low across the currently filtered sessions.
+  const workloadOverall = useMemo(() => {
+    let high = 0;
+    let total = 0;
+    filteredSessions.forEach((s) => {
+      (s.steps || []).forEach((st) => {
+        high += st.highPredictionCount || 0;
+        total += st.predictionCount || 0;
+      });
+    });
+    const low = Math.max(0, total - high);
+    return {
+      high,
+      low,
+      total,
+      pctHigh: total ? Math.round((100 * high) / total) : 0,
+      pctLow: total ? Math.round((100 * low) / total) : 0,
+      hasData: total > 0,
+    };
+  }, [filteredSessions]);
+
   const handleExportCSV = () => {
     const headers = [
       'SessionId', 'CompletedAt', 'Participant', 'Procedure', 'Train', 'TotalTimeSec',
       'StepNumber', 'StepTitle', 'TimeSpentSec',
       'WorkloadHigh', 'AdaptationShown', 'FinalWorkloadLevel', 'TimeToAdaptationSec',
-      'MaxHighProba', 'HighPredictionCount', 'PredictionCount',
+      'MaxHighProba', 'HighSeconds', 'LowSeconds', 'PredictionSeconds', 'PctHigh', 'PctLow',
       'ExceededThreshold(legacy)', 'SubStepsShown(legacy)',
     ];
     const rows = [];
     selectedSessions.forEach((s) => {
       (s.steps || []).forEach((st) => {
+        const high = st.highPredictionCount || 0;
+        const total = st.predictionCount || 0;
+        const low = Math.max(0, total - high);
         rows.push([
           s.id || s.sessionId,
           new Date(getCompletedAtMs(s)).toISOString(),
-          s.participantUsername || s.participantId || '',
+          resolveParticipant(s),
           s.procedureName || getProcedureName(s.procedureId),
           s.trainNumber ? `Train ${s.trainNumber}` : 'N/A',
           s.totalTimeSec || 0,
@@ -224,8 +323,11 @@ const Analytics = () => {
           st.finalWorkloadLevel || '',
           st.timeToAdaptationSec == null ? '' : st.timeToAdaptationSec,
           st.maxHighProba == null ? '' : st.maxHighProba,
-          st.highPredictionCount == null ? '' : st.highPredictionCount,
-          st.predictionCount == null ? '' : st.predictionCount,
+          high,
+          low,
+          total,
+          total ? Math.round((100 * high) / total) : '',
+          total ? Math.round((100 * low) / total) : '',
           st.exceededThreshold ? 'yes' : 'no',
           st.subStepsShown ? 'yes' : 'no',
         ]);
@@ -241,12 +343,10 @@ const Analytics = () => {
     URL.revokeObjectURL(url);
   };
 
+  // Always show most-recent sessions first.
   const sortedSessions = useMemo(() => {
-    if (isAdmin) {
-      return filteredSessions.slice().reverse();
-    }
     return filteredSessions.slice().sort((a, b) => getCompletedAtMs(b) - getCompletedAtMs(a));
-  }, [filteredSessions, isAdmin]);
+  }, [filteredSessions]);
 
   const totalPages = Math.max(1, Math.ceil(sortedSessions.length / pageSize));
   const paginatedSessions = useMemo(() => {
@@ -377,56 +477,109 @@ const Analytics = () => {
         </div>
       </div>
 
-      {selectedProcedureId !== 'all' && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="bg-white rounded-lg shadow p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-3">Average Time by Step(s)</h3>
-            <div className="h-64">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={avgTimeByStepData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="step" />
-                  <YAxis />
-                  <Tooltip formatter={(v) => formatTime(v)} />
-                  <Bar dataKey="seconds" fill="#3b82f6" />
-                </BarChart>
-              </ResponsiveContainer>
+      {/* Overall workload time distribution across the filtered sessions. */}
+      {workloadOverall.hasData && (
+        <div className="bg-white rounded-lg shadow p-6">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-lg font-semibold text-gray-900">Workload Time Distribution</h3>
+            <span className="text-sm text-gray-500">Total monitored: {formatTime(workloadOverall.total)} ({workloadOverall.total}s)</span>
+          </div>
+          <div className="flex h-5 w-full rounded overflow-hidden bg-gray-100">
+            <div className="bg-orange-400 flex items-center justify-center text-xs text-white font-medium" style={{ width: `${workloadOverall.pctHigh}%` }}>
+              {workloadOverall.pctHigh >= 8 ? `${workloadOverall.pctHigh}%` : ''}
+            </div>
+            <div className="bg-green-400 flex-1 flex items-center justify-center text-xs text-white font-medium">
+              {workloadOverall.pctLow >= 8 ? `${workloadOverall.pctLow}%` : ''}
             </div>
           </div>
+          <div className="flex items-center gap-6 mt-3 text-sm">
+            <span className="inline-flex items-center gap-2">
+              <span className="w-3 h-3 rounded-sm bg-orange-400" />
+              <span className="text-gray-700">High: <span className="font-medium">{workloadOverall.high}s</span> ({workloadOverall.pctHigh}%)</span>
+            </span>
+            <span className="inline-flex items-center gap-2">
+              <span className="w-3 h-3 rounded-sm bg-green-400" />
+              <span className="text-gray-700">Low: <span className="font-medium">{workloadOverall.low}s</span> ({workloadOverall.pctLow}%)</span>
+            </span>
+          </div>
+          <p className="text-xs text-gray-400 mt-2">
+            Share of monitored time the model judged workload high versus low, summed over the filtered sessions. High plus low equals 100%.
+          </p>
+        </div>
+      )}
+
+      {selectedProcedureId !== 'all' && (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="bg-white rounded-lg shadow p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-3">Average Time by Step(s)</h3>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={avgTimeByStepData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="step" />
+                    <YAxis />
+                    <Tooltip formatter={(v) => formatTime(v)} />
+                    <Bar dataKey="seconds" fill="#3b82f6" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-3">High-Workload Adaptation Rate by Step(%)</h3>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={adaptationRateByStepData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="step" />
+                    <YAxis unit="%" />
+                    <Tooltip formatter={(v) => `${v}%`} />
+                    <Bar dataKey="rate" fill="#f97316" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Percent of sessions where the model flagged <span className="font-medium text-orange-700">high workload</span> on
+                this step and adaptive guidance was shown.
+              </p>
+            </div>
+          </div>
+
           <div className="bg-white rounded-lg shadow p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-3">High-Workload Adaptation Rate by Step(%)</h3>
+            <h3 className="text-lg font-semibold text-gray-900 mb-3">Average Share of Time in High Workload by Step(%)</h3>
             <div className="h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={adaptationRateByStepData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                <BarChart data={highTimeShareByStepData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="step" />
-                  <YAxis unit="%" />
+                  <YAxis unit="%" domain={[0, 100]} />
                   <Tooltip formatter={(v) => `${v}%`} />
-                  <Bar dataKey="rate" fill="#f97316" />
+                  <Bar dataKey="share" fill="#ea580c" />
                 </BarChart>
               </ResponsiveContainer>
             </div>
             <p className="text-xs text-gray-500 mt-2">
-              Percent of sessions where the model flagged <span className="font-medium text-orange-700">high workload</span> on
-              this step and adaptive guidance was shown.
+              Of the seconds monitored on each step, the share the model judged high workload (averaged over the selected sessions).
+              This is finer than the adaptation rate, which only asks whether high was ever reached.
             </p>
           </div>
-        </div>
+        </>
       )}
 
       <div className="bg-white rounded-lg shadow p-6">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-xl font-semibold text-gray-900">Recent Sessions</h2>
+          <span className="text-sm text-gray-500">Most recent first</span>
         </div>
 
         {filteredSessions.length === 0 ? (
           <div className="text-gray-600">No completed sessions yet.</div>
         ) : (
-          <div className="w-[90%] mx-auto pl-2">
-            <table className="min-w-full w-full text-left table-fixed">
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-left text-sm">
               <thead>
-                <tr className="text-gray-600 text-sm">
-                  <th className="py-2 pr-4 w-8">
+                <tr className="text-gray-600 border-b border-gray-200">
+                  <th className="px-3 py-2 w-8">
                     <input
                       type="checkbox"
                       aria-label="Select all"
@@ -440,30 +593,42 @@ const Analytics = () => {
                       }}
                     />
                   </th>
-                  <th className="py-2 pr-16 w-60">Completed</th>
-                  {isAdmin && <th className="py-2 pr-16 w-60">Participant</th>}
-                  <th className="py-2 pr-16 w-60">Procedure</th>
-                  <th className="py-2 pr-16 w-40">Train</th>
-                  <th className="py-2 pr-16 w-60">Total Time</th>
-                  <th className="py-2 pr-16">
+                  <th className="px-3 py-2 whitespace-nowrap">Completed</th>
+                  {isAdmin && <th className="px-3 py-2 whitespace-nowrap">Participant</th>}
+                  <th className="px-3 py-2 whitespace-nowrap">Procedure</th>
+                  <th className="px-3 py-2 whitespace-nowrap">Train</th>
+                  <th className="px-3 py-2 whitespace-nowrap">Total Time</th>
+                  <th className="px-3 py-2 whitespace-nowrap">
+                    <div className="relative inline-flex items-center space-x-1 group cursor-default">
+                      <span>Workload time (high / low)</span>
+                      <Info className="w-4 h-4 text-gray-400" />
+                      <span
+                        role="tooltip"
+                        className="invisible group-hover:visible absolute left-0 top-full mt-2 w-72 text-xs text-gray-800 bg-white border border-gray-200 rounded-md shadow p-2 z-10 normal-case font-normal"
+                      >
+                        Seconds the model judged workload high versus low during this session (one prediction per second). High plus low equals the total monitored time.
+                      </span>
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 whitespace-nowrap">
                     <div className="relative inline-flex items-center space-x-1 group cursor-default">
                       <span>Steps</span>
                       <Info className="w-4 h-4 text-gray-400" />
                       <span
                         role="tooltip"
-                        className="invisible group-hover:visible absolute left-0 top-full mt-2 w-64 text-xs text-gray-800 bg-white border border-gray-200 rounded-md shadow p-2 z-10"
+                        className="invisible group-hover:visible absolute left-0 top-full mt-2 w-64 text-xs text-gray-800 bg-white border border-gray-200 rounded-md shadow p-2 z-10 normal-case font-normal"
                       >
                         Total main steps defined for the selected procedure. Sub-steps are not counted.
                       </span>
                     </div>
                   </th>
-                  <th className="py-2 pr-16">
+                  <th className="px-3 py-2 whitespace-nowrap">
                     <div className="relative inline-flex items-center space-x-1 group cursor-default">
                       <span>Adaptations</span>
                       <Info className="w-4 h-4 text-gray-400" />
                       <span
                         role="tooltip"
-                        className="invisible group-hover:visible absolute left-0 top-full mt-2 w-72 text-xs text-gray-800 bg-white border border-gray-200 rounded-md shadow p-2 z-10"
+                        className="invisible group-hover:visible absolute right-0 top-full mt-2 w-72 text-xs text-gray-800 bg-white border border-gray-200 rounded-md shadow p-2 z-10 normal-case font-normal"
                       >
                         Main steps where the ML model flagged high workload and adaptive guidance was shown, out of total steps. Expand a row for the per-step breakdown.
                       </span>
@@ -478,11 +643,12 @@ const Analytics = () => {
                   const guidanceCount = steps.filter((x) => stepAdapted(x)).length;
                   const guidanceRate = steps.length ? Math.round((100 * guidanceCount) / steps.length) : 0;
                   const isExpanded = expandedSessionIds.has(key);
-                  const colCount = isAdmin ? 8 : 7;
+                  const wl = sessionWorkload(s);
+                  const colCount = isAdmin ? 9 : 8;
                   return (
                     <React.Fragment key={key}>
                       <tr className="border-t border-gray-200">
-                        <td className="py-2 pr-4">
+                        <td className="px-3 py-3">
                           <input
                             type="checkbox"
                             checked={selectedSessionIds.has(key)}
@@ -495,7 +661,7 @@ const Analytics = () => {
                             }}
                           />
                         </td>
-                        <td className="py-2 pr-4 text-gray-700">
+                        <td className="px-3 py-3 text-gray-700 whitespace-nowrap">
                           <button
                             type="button"
                             onClick={() => toggleSessionExpanded(key)}
@@ -508,14 +674,14 @@ const Analytics = () => {
                           </button>
                         </td>
                         {isAdmin && (
-                          <td className="py-2 pr-4 text-gray-700 truncate">
-                            <span className="inline-flex max-w-[8rem] items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 truncate">
-                              {s.participantUsername || s.participantId || 'Unknown'}
+                          <td className="px-3 py-3 text-gray-700 whitespace-nowrap">
+                            <span className="inline-flex max-w-[10rem] items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 truncate">
+                              {resolveParticipant(s)}
                             </span>
                           </td>
                         )}
-                        <td className="py-2 pr-4 text-gray-700">{s.procedureName || getProcedureName(s.procedureId)}</td>
-                        <td className="py-2 pr-4 text-gray-700">
+                        <td className="px-3 py-3 text-gray-700 whitespace-nowrap">{s.procedureName || getProcedureName(s.procedureId)}</td>
+                        <td className="px-3 py-3 text-gray-700 whitespace-nowrap">
                           {s.trainNumber ? (
                             <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
                               Train {s.trainNumber}
@@ -524,9 +690,12 @@ const Analytics = () => {
                             <span className="text-gray-400 text-xs">N/A</span>
                           )}
                         </td>
-                        <td className="py-2 pr-4 text-gray-700">{formatTime(s.totalTimeSec || 0)}</td>
-                        <td className="py-2 pr-4 text-gray-700">{steps.length}</td>
-                        <td className="py-2 pr-4 text-gray-700">
+                        <td className="px-3 py-3 text-gray-700 whitespace-nowrap">{formatTime(s.totalTimeSec || 0)}</td>
+                        <td className="px-3 py-3">
+                          <WorkloadSplitBar wl={wl} />
+                        </td>
+                        <td className="px-3 py-3 text-gray-700">{steps.length}</td>
+                        <td className="px-3 py-3 text-gray-700 whitespace-nowrap">
                           <span className={`font-medium ${guidanceCount > 0 ? 'text-orange-700' : 'text-gray-500'}`}>
                             {guidanceCount}/{steps.length}
                           </span>
@@ -546,6 +715,9 @@ const Analytics = () => {
                                     <th className="text-left py-1 pr-4">Title</th>
                                     <th className="text-left py-1 pr-4">Time</th>
                                     <th className="text-left py-1 pr-4">Workload</th>
+                                    <th className="text-left py-1 pr-4">High (s)</th>
+                                    <th className="text-left py-1 pr-4">Low (s)</th>
+                                    <th className="text-left py-1 pr-4">% High</th>
                                     <th className="text-left py-1 pr-4">Adapted</th>
                                     <th className="text-left py-1 pr-4">Time → adaptation</th>
                                     <th className="text-left py-1 pr-4">Peak P(high)</th>
@@ -555,6 +727,10 @@ const Analytics = () => {
                                   {steps.slice().sort((a, b) => (a.stepNumber || 0) - (b.stepNumber || 0)).map((st) => {
                                     const adapted = stepAdapted(st);
                                     const lvl = st.finalWorkloadLevel || (st.workloadReachedHigh ? 'high' : 'low');
+                                    const high = st.highPredictionCount || 0;
+                                    const total = st.predictionCount || 0;
+                                    const low = Math.max(0, total - high);
+                                    const pctHigh = total ? Math.round((100 * high) / total) : null;
                                     return (
                                       <tr key={st.stepId || st.stepNumber} className="border-t border-gray-200">
                                         <td className="py-1 pr-4 text-gray-700">Step {st.stepNumber}</td>
@@ -565,6 +741,9 @@ const Analytics = () => {
                                             {lvl}
                                           </span>
                                         </td>
+                                        <td className="py-1 pr-4 text-orange-700">{total ? `${high}s` : '—'}</td>
+                                        <td className="py-1 pr-4 text-green-700">{total ? `${low}s` : '—'}</td>
+                                        <td className="py-1 pr-4 text-gray-700">{pctHigh == null ? '—' : `${pctHigh}%`}</td>
                                         <td className="py-1 pr-4">
                                           {adapted ? (
                                             <span className="text-orange-700 font-medium">Yes</span>
