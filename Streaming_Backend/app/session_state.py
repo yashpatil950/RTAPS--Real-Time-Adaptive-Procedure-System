@@ -310,6 +310,22 @@ class SessionState:
     last_fixation_received_at: Optional[float] = None  # wall clock
     last_blink_received_at: Optional[float] = None     # wall clock
 
+    # Procedure mode echoed from the frontend ('adaptive' | 'non-adaptive'),
+    # recorded in the raw archive metadata.
+    mode: Optional[str] = None
+
+    # ---- Raw archival accumulators (untrimmed; persisted on session end) --- #
+    # When `record_raw` is set, every received sample is appended here in full,
+    # independently of the trimmed rolling buffers below, so the complete
+    # session can be written to the raw archive (see app/raw_store.py).
+    record_raw: bool = False
+    raw_max_samples: int = 2_000_000
+    raw_truncated: bool = field(default=False, init=False)
+    _raw_pupil: list = field(default_factory=list)
+    _raw_blinks: list = field(default_factory=list)
+    _raw_fixations: list = field(default_factory=list)
+    _step_changes: list = field(default_factory=list)
+
     # Plain Python deques sized to ~ generous worst-case for the longest
     # per-feature window (blink/fixation = 30 s).
     _pupil: Deque[_PupilRec] = field(default_factory=lambda: deque(maxlen=4000))
@@ -338,6 +354,42 @@ class SessionState:
         self.baseline = BaselineTracker(self.baseline_duration_s, self.min_confidence)
 
     # ---- ingress -------------------------------------------------------- #
+
+    def _raw_append(self, buf: list, item: dict) -> None:
+        """Append to a raw archival buffer, respecting the per-session cap."""
+        if (len(self._raw_pupil) + len(self._raw_blinks) + len(self._raw_fixations)) >= self.raw_max_samples:
+            self.raw_truncated = True
+            return
+        buf.append(item)
+
+    def add_raw_events(
+        self,
+        pupil: Optional[list] = None,
+        blinks: Optional[list] = None,
+        fixations: Optional[list] = None,
+    ) -> int:
+        """Archive the unfiltered raw stream (full Pupil payloads, verbatim).
+
+        Fed by the bridge's dedicated /stream/raw channel, independently of the
+        cleaned feature pipeline below — so it keeps EVERYTHING, including
+        low-confidence samples and the Online detectors' raw blink/fixation
+        events, exactly as received.
+        """
+        if not self.record_raw:
+            return 0
+        n = 0
+        for item in (pupil or []):
+            self._raw_append(self._raw_pupil, item)
+            n += 1
+        for item in (blinks or []):
+            self._raw_append(self._raw_blinks, item)
+            n += 1
+        for item in (fixations or []):
+            self._raw_append(self._raw_fixations, item)
+            n += 1
+        if n:
+            self.last_seen_wall = time.time()
+        return n
 
     def add_pupil(self, samples: list[_PupilRec]) -> int:
         accepted = 0
@@ -439,10 +491,13 @@ class SessionState:
         procedure_id: int,
         participant_id: Optional[str],
         n_steps_total: Optional[int],
+        mode: Optional[str] = None,
     ) -> None:
         self.procedure_id = procedure_id
         self.participant_id = participant_id
         self.n_steps_total = n_steps_total
+        if mode is not None:
+            self.mode = mode
         self.session_started_at = self.latest_pupil_t  # may be None until first pupil
         self.step_number = None
         self.step_id = None
@@ -471,6 +526,54 @@ class SessionState:
         self.step_number = step_number
         self.step_id = step_id
         self.step_changed_at = self.latest_pupil_t
+        if self.record_raw:
+            self._step_changes.append({
+                "step_number": step_number,
+                "step_id": step_id,
+                "pupil_t": self.latest_pupil_t,
+                "wall": time.time(),
+            })
+
+    def has_raw(self) -> bool:
+        return bool(self._raw_pupil or self._raw_blinks or self._raw_fixations)
+
+    def raw_dataset(self, extra_meta: Optional[dict] = None) -> dict:
+        """Assemble the full raw-archive document for this session."""
+        def _raw_t(rec: dict):
+            return rec.get("timestamp", rec.get("t"))
+
+        first_t = _raw_t(self._raw_pupil[0]) if self._raw_pupil else None
+        last_t = self.latest_pupil_t
+        if last_t is None and self._raw_pupil:
+            last_t = _raw_t(self._raw_pupil[-1])
+        duration_s = (last_t - first_t) if (first_t is not None and last_t is not None) else None
+        meta = {
+            "stream_id": self.stream_id,
+            "participant_id": self.participant_id,
+            "procedure_id": self.procedure_id,
+            "mode": self.mode,
+            "n_steps_total": self.n_steps_total,
+            "session_started_at": self.session_started_at,
+            "calibration_started_at": self.calibration_started_at,
+            "calibration_ended_at": self.calibration_ended_at,
+            "first_pupil_t": first_t,
+            "latest_pupil_t": last_t,
+            "duration_s": duration_s,
+            "n_pupil": len(self._raw_pupil),
+            "n_blinks": len(self._raw_blinks),
+            "n_fixations": len(self._raw_fixations),
+            "truncated": self.raw_truncated,
+            "step_changes": list(self._step_changes),
+            "persisted_at": time.time(),
+        }
+        if extra_meta:
+            meta.update(extra_meta)
+        return {
+            "meta": meta,
+            "pupil": self._raw_pupil,
+            "blinks": self._raw_blinks,
+            "fixations": self._raw_fixations,
+        }
 
     def maybe_anchor_session_start(self) -> None:
         """If session_start arrived before any pupil, anchor it to the first
@@ -639,6 +742,8 @@ class SessionRegistry:
         min_confidence: float,
         blink_tracking_loss_s: float,
         idle_ttl_s: float,
+        record_raw: bool = False,
+        raw_max_samples: int = 2_000_000,
     ):
         self._window_len_s = window_len_s
         self._fixation_window_len_s = fixation_window_len_s
@@ -647,6 +752,8 @@ class SessionRegistry:
         self._min_confidence = min_confidence
         self._blink_tracking_loss_s = blink_tracking_loss_s
         self._idle_ttl_s = idle_ttl_s
+        self._record_raw = record_raw
+        self._raw_max_samples = raw_max_samples
         self._streams: dict[str, SessionState] = {}
         self._lock = asyncio.Lock()
 
@@ -662,6 +769,8 @@ class SessionRegistry:
                     baseline_duration_s=self._baseline_duration_s,
                     min_confidence=self._min_confidence,
                     blink_tracking_loss_s=self._blink_tracking_loss_s,
+                    record_raw=self._record_raw,
+                    raw_max_samples=self._raw_max_samples,
                 )
                 self._streams[stream_id] = st
             return st

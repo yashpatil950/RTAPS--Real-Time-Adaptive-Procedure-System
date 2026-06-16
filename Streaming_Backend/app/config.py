@@ -31,6 +31,13 @@ def _csv_list(name: str, default: str) -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 class Settings:
     app_name: str = os.getenv("APP_NAME", "rtaps-streaming-backend")
     host: str = os.getenv("HOST", "0.0.0.0")
@@ -102,6 +109,27 @@ class Settings:
 
     # ---- Optional outbound webhook (push predictions to RTAPS frontend) --
     prediction_webhook_url: str = os.getenv("PREDICTION_WEBHOOK_URL", "")
+
+    # ---- Raw eye-data archival ------------------------------------------
+    # When enabled, every session accumulates the full (untrimmed) stream of
+    # pupil/blink/fixation samples plus session metadata and, on session end,
+    # writes one compressed file to Amazon S3 (or to a local directory when no
+    # bucket is configured). This raw archive is independent of the live feature
+    # pipeline and is intended for future analysis or model development.
+    raw_data_enabled: bool = _env_bool("RAW_DATA_ENABLED", True)
+    # S3 bucket for the raw archive. When empty, raw files are written to
+    # `raw_data_dir` on the backend's local disk instead.
+    raw_data_s3_bucket: str = os.getenv("RAW_DATA_S3_BUCKET", "")
+    raw_data_s3_prefix: str = os.getenv("RAW_DATA_S3_PREFIX", "raw_sessions")
+    aws_region: str = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
+    raw_data_dir: Path = _env_path(
+        "RAW_DATA_DIR",
+        str(Path(__file__).resolve().parents[1] / "raw_sessions"),
+    )
+    # Hard cap on accumulated samples per session, to bound memory under an
+    # unexpectedly long or runaway stream. Beyond this the session is flagged
+    # truncated and stops accumulating (a typical procedure is far below it).
+    raw_data_max_samples: int = _env_int("RAW_DATA_MAX_SAMPLES", 2_000_000)
 
     # ---- House-keeping ---------------------------------------------------
     # When a stream goes idle (no pupil samples) for this many seconds, drop it.

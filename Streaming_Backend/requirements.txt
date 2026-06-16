@@ -10,3 +10,6 @@ joblib>=1.3
 pyzmq>=25.0
 msgpack>=1.0
 requests>=2.31
+# Raw eye-data archival to Amazon S3 (only needed when RAW_DATA_S3_BUCKET is set;
+# local-disk archival works without boto3)
+boto3>=1.34

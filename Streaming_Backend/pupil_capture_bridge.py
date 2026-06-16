@@ -62,7 +62,12 @@ def _cli() -> argparse.Namespace:
     ap.add_argument(
         "--verbose",
         action="store_true",
-        help="Log ZMQ topics / fixation payload keys (for debugging missing fixations)",
+        help="Log ZMQ topics, per-blink de-dup tracing, and fixation payload keys (for debugging)",
+    )
+    ap.add_argument(
+        "--no_raw_archive",
+        action="store_true",
+        help="Disable forwarding the unfiltered raw stream to the backend's /stream/raw archival channel",
     )
     return ap.parse_args()
 
@@ -108,6 +113,75 @@ def _post(ctx: BridgeContext, path: str, body: dict[str, Any]) -> None:
             log.warning("POST %s -> %s: %s", path, r.status_code, r.text[:200])
     except Exception as exc:
         log.warning("POST %s failed: %s", path, exc)
+
+
+def _json_safe(obj: Any) -> Any:
+    """Recursively coerce a decoded Pupil payload into JSON-serialisable form
+    (bytes -> str, str-ify anything exotic), preserving every field as-is so the
+    raw archive keeps the complete datum."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            key = k.decode("utf-8", "replace") if isinstance(k, bytes) else str(k)
+            out[key] = _json_safe(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", "replace")
+    if isinstance(obj, bool) or obj is None or isinstance(obj, (str, int, float)):
+        return obj
+    return str(obj)
+
+
+class RawBatcher:
+    """Forwards the COMPLETE, unmodified Pupil payloads (pupil, blink, fixation)
+    to the backend's raw archival channel. Unlike the feature path, nothing is
+    dropped or de-duplicated here: low-confidence samples and every raw
+    blink/fixation event are kept exactly as received."""
+
+    def __init__(self, ctx: "BridgeContext", max_size: int = 240, max_ms: int = 200):
+        self._ctx = ctx
+        self._max_size = max_size
+        self._max_seconds = max_ms / 1000.0
+        self._pupil: list[dict] = []
+        self._blinks: list[dict] = []
+        self._fixations: list[dict] = []
+        self._opened_at = 0.0
+        self._lock = threading.Lock()
+
+    def add(self, kind: str, payload: dict) -> None:
+        item = _json_safe(payload)
+        with self._lock:
+            if not (self._pupil or self._blinks or self._fixations):
+                self._opened_at = time.monotonic()
+            if kind == "pupil":
+                self._pupil.append(item)
+            elif kind == "blink":
+                self._blinks.append(item)
+            else:
+                self._fixations.append(item)
+            if (len(self._pupil) + len(self._blinks) + len(self._fixations)) >= self._max_size:
+                self._flush_locked()
+
+    def maybe_flush(self) -> None:
+        with self._lock:
+            if (self._pupil or self._blinks or self._fixations) and (
+                time.monotonic() - self._opened_at
+            ) >= self._max_seconds:
+                self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if not (self._pupil or self._blinks or self._fixations):
+            return
+        body = {
+            "stream_id": self._ctx.stream_id,
+            "pupil": self._pupil,
+            "blinks": self._blinks,
+            "fixations": self._fixations,
+        }
+        self._pupil, self._blinks, self._fixations = [], [], []
+        _post(self._ctx, "/stream/raw", body)
 
 
 def _connect_pupil(host: str, port: int) -> tuple[zmq.Context, zmq.Socket, str]:
@@ -215,44 +289,49 @@ class PupilBatcher:
         _post(self._ctx, "/stream/pupil", {"stream_id": self._ctx.stream_id, "samples": batch})
 
 
-# Min gap (Pupil clock seconds) between two forwarded blinks when the events
-# carry no `type` tag — long enough to swallow an untyped onset/offset pair,
-# short enough to keep genuinely separate blinks (typical inter-blink interval
-# is seconds, far above this).
-_BLINK_MIN_INTERVAL_S = 0.4
+# Refractory window (Pupil clock seconds) used to collapse the several events
+# that the Online Blink Detector can emit for a single physical blink (an
+# onset/offset pair, or the onset re-emitted on consecutive frames). Long
+# enough to swallow those repeats, short enough to keep genuinely separate
+# blinks, whose inter-blink interval is normally seconds.
+_BLINK_MIN_INTERVAL_S = 0.5
 
 
 def _handle_blink(ctx: BridgeContext, payload: dict[str, Any]) -> None:
     """Forward exactly one backend blink per physical blink.
 
-    Pupil Capture's Online Blink Detector publishes TWO messages per blink on
-    the `blink`/`blinks` topic — an `onset` (blink start) and an `offset`
-    (blink end) — each as its own ZMQ event. Forwarding both made the backend
-    count a single blink twice: the UI "Blinks" tile jumped by ~2 per blink and
-    the `blink_rate_30s` model feature ran at ~2x its training scale. (This is
-    the same multi-emit behaviour that `session_state.add_fixations` already
-    collapses for the Online Fixation Detector.)
+    Pupil Capture's Online Blink Detector can publish several events for a single
+    physical blink on the `blink`/`blinks` topic: an `onset` (blink start) and an
+    `offset` (blink end), and on some builds the `onset` is re-emitted on
+    consecutive frames for the duration of the blink. Forwarding every event made
+    the backend count one blink many times, so the `blink_rate_30s` model feature
+    ran well above its training scale. (This is the same multi-emit behaviour that
+    `session_state.add_fixations` already collapses for the Online Fixation
+    Detector.)
 
-    We count each blink once, at its `onset` — whose `timestamp` is the blink
-    start that the backend's `BlinkEvent.start_timestamp` documents. Builds that
-    don't tag events with `type` fall back to a short debounce so a double-emit
-    can't slip through.
+    To count each blink once we drop the `offset` events and debounce every other
+    event against the last forwarded blink: any event arriving within
+    `_BLINK_MIN_INTERVAL_S` of the previous count is treated as the same physical
+    blink. Genuinely separate blinks are far enough apart to pass.
     """
     blink_type = payload.get("type")
     if isinstance(blink_type, bytes):
         blink_type = blink_type.decode("utf-8", errors="replace")
-    if blink_type == "offset":
-        return  # the matching `onset` already counted this blink
-
     start_ts = float(payload.get("timestamp", time.time()))
-    if (
-        blink_type != "onset"
-        and ctx.last_blink_t >= 0
-        and (start_ts - ctx.last_blink_t) < _BLINK_MIN_INTERVAL_S
-    ):
-        return  # untyped event within debounce window — same physical blink
+    log.debug("blink event: type=%r t=%.3f", blink_type, start_ts)
+
+    if blink_type == "offset":
+        log.debug("  blink skipped (offset; paired onset already counted)")
+        return
+    if ctx.last_blink_t >= 0 and (start_ts - ctx.last_blink_t) < _BLINK_MIN_INTERVAL_S:
+        log.debug(
+            "  blink debounced (%.3fs since last forwarded; same physical blink)",
+            start_ts - ctx.last_blink_t,
+        )
+        return
 
     ctx.last_blink_t = start_ts
+    log.debug("  blink forwarded as 1 count")
     body = {
         "stream_id": ctx.stream_id,
         "blinks": [
@@ -360,6 +439,10 @@ def main() -> int:
         max_ms=args.pupil_batch_ms,
         min_confidence=args.min_confidence,
     )
+    raw_batcher = RawBatcher(ctx) if not args.no_raw_archive else None
+    if raw_batcher is not None:
+        log.info("Raw archival: forwarding ALL events verbatim to /stream/raw "
+                 "(disable with --no_raw_archive).")
 
     poller = zmq.Poller()
     poller.register(sub, zmq.POLLIN)
@@ -419,26 +502,38 @@ def main() -> int:
                 if topic_str.startswith("pupil"):
                     _record_and_log("pupil")
                     batcher.add(payload)
+                    if raw_batcher is not None:
+                        raw_batcher.add("pupil", payload)
                 elif fixation_inner:
                     _record_and_log("fixation")
                     _handle_fixation(ctx, payload)
+                    if raw_batcher is not None:
+                        raw_batcher.add("fixation", payload)
                 elif topic_str.startswith("blink"):
                     _record_and_log("blink")
                     _handle_blink(ctx, payload)
+                    if raw_batcher is not None:
+                        raw_batcher.add("blink", payload)
                 elif topic_str.startswith("fixation"):
                     _record_and_log("fixation")
                     _handle_fixation(ctx, payload)
+                    if raw_batcher is not None:
+                        raw_batcher.add("fixation", payload)
                 elif topic_str.startswith("notify."):
                     # Notifications use envelope ``notify.<subject>``; some builds encode fixation-like datums here.
                     subj = payload.get("subject")
                     if isinstance(subj, str) and "fixation" in subj.lower() and payload.get("start_timestamp") is not None:
                         _record_and_log("fixation")
                         _handle_fixation(ctx, payload)
+                        if raw_batcher is not None:
+                            raw_batcher.add("fixation", payload)
                     else:
                         counts["notify"] += 1
                 else:
                     counts["other"] += 1
             batcher.maybe_flush()
+            if raw_batcher is not None:
+                raw_batcher.maybe_flush()
 
             # Periodic counter summary (every 30 s) so the operator can see
             # at a glance whether fixations are arriving.

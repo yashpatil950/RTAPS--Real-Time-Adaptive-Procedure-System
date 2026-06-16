@@ -63,6 +63,17 @@ class FixationIngestRequest(BaseModel):
     fixations: list[FixationEvent] = Field(..., min_length=1)
 
 
+class RawIngestRequest(BaseModel):
+    """Unfiltered raw archival channel: full Pupil payloads forwarded verbatim
+    by the bridge (everything, including low-confidence samples and the raw
+    blink/fixation events). Stored as-is, never used by the feature pipeline."""
+
+    stream_id: str
+    pupil: list[dict[str, Any]] = Field(default_factory=list)
+    blinks: list[dict[str, Any]] = Field(default_factory=list)
+    fixations: list[dict[str, Any]] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------- #
 # Session/UI events (from the RTAPS frontend)                                 #
 # --------------------------------------------------------------------------- #
@@ -73,6 +84,7 @@ class SessionStartRequest(BaseModel):
     procedure_id: int = Field(..., ge=1, le=3, description="1=Centrifuge, 2=Column Flushing, 3=Pressure Testing")
     participant_id: str | None = None
     n_steps_total: int | None = None
+    mode: str | None = Field(default=None, description="'adaptive' | 'non-adaptive' (recorded in the raw archive)")
 
 
 class StepChangeRequest(BaseModel):

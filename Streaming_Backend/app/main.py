@@ -30,11 +30,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 
 from app.config import settings
@@ -49,6 +50,7 @@ from app.schemas import (
     IngestResponse,
     PredictionResponse,
     PupilIngestRequest,
+    RawIngestRequest,
     SessionAck,
     SessionEndRequest,
     SessionStartRequest,
@@ -56,6 +58,7 @@ from app.schemas import (
     StepChangeRequest,
 )
 from app.session_state import BlinkRec, FixRec, PupilRec, SessionRegistry
+from app import raw_store
 
 log = logging.getLogger("rtaps.backend")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -76,6 +79,8 @@ async def lifespan(app: FastAPI):
         min_confidence=settings.min_confidence,
         blink_tracking_loss_s=settings.blink_tracking_loss_s,
         idle_ttl_s=settings.session_idle_ttl_s,
+        record_raw=settings.raw_data_enabled,
+        raw_max_samples=settings.raw_data_max_samples,
     )
 
     predictor: LocalPredictor | None = None
@@ -201,6 +206,18 @@ async def ingest_fixations(req: FixationIngestRequest) -> IngestResponse:
     return resp
 
 
+@app.post("/stream/raw", response_model=IngestResponse)
+async def ingest_raw(req: RawIngestRequest) -> IngestResponse:
+    """Unfiltered raw archival channel — full Pupil payloads stored verbatim,
+    independent of the feature pipeline (see SessionState.add_raw_events)."""
+    st = await app.state.registry.get_or_create(req.stream_id)
+    async with st.lock:
+        accepted = st.add_raw_events(pupil=req.pupil, blinks=req.blinks, fixations=req.fixations)
+    resp = _ingest_response(st)
+    resp.accepted = accepted
+    return resp
+
+
 # --------------------------------------------------------------------------- #
 # UI events                                                                   #
 # --------------------------------------------------------------------------- #
@@ -214,6 +231,7 @@ async def session_start(req: SessionStartRequest) -> SessionAck:
             procedure_id=req.procedure_id,
             participant_id=req.participant_id,
             n_steps_total=req.n_steps_total,
+            mode=req.mode,
         )
     return SessionAck(
         stream_id=req.stream_id,
@@ -341,11 +359,68 @@ async def session_step_change(req: StepChangeRequest) -> SessionAck:
 
 @app.post("/session/end", response_model=SessionAck)
 async def session_end(req: SessionEndRequest) -> SessionAck:
+    st = app.state.registry.get(req.stream_id)
+    archived_key: str | None = None
+    if st is not None and settings.raw_data_enabled and st.has_raw():
+        # Build the raw document under the session lock, then write it off the
+        # event loop (boto3/disk I/O is blocking).
+        async with st.lock:
+            dataset = st.raw_dataset(extra_meta={"ended_at": time.time()})
+        try:
+            index = await asyncio.to_thread(raw_store.persist_session, dataset)
+            archived_key = index.get("key")
+        except Exception as exc:  # noqa: BLE001 - never fail the UI on archival error
+            log.error("raw archival failed for %s: %s", req.stream_id, exc)
     dropped = await app.state.registry.drop(req.stream_id)
     return SessionAck(
         stream_id=req.stream_id,
         status="ended" if dropped else "not_found",
+        message=(f"Raw session archived: {archived_key}" if archived_key else None),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Raw eye-data archive                                                         #
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/raw_sessions")
+async def list_raw_sessions() -> dict:
+    """Index of archived raw sessions (metadata only)."""
+    try:
+        sessions = await asyncio.to_thread(raw_store.list_sessions)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Could not list raw sessions: {exc}") from exc
+    return {
+        "storage": "s3" if raw_store.use_s3() else "local",
+        "bucket": settings.raw_data_s3_bucket or None,
+        "count": len(sessions),
+        "sessions": sessions,
+    }
+
+
+@app.get("/raw_sessions/{key:path}/download")
+async def download_raw_session(key: str):
+    """Download one raw file: redirect to a presigned S3 URL, or stream the
+    local file when archival is on disk."""
+    if raw_store.use_s3():
+        url = await asyncio.to_thread(raw_store.presign_url, key)
+        if not url:
+            raise HTTPException(404, "Raw session not found")
+        return RedirectResponse(url)
+    path = raw_store.local_path(key)
+    if path is None:
+        raise HTTPException(404, "Raw session not found")
+    return FileResponse(path, media_type="application/gzip", filename=path.name)
+
+
+@app.delete("/raw_sessions/{key:path}", response_model=SessionAck)
+async def delete_raw_session(key: str) -> SessionAck:
+    try:
+        removed = await asyncio.to_thread(raw_store.delete_session, key)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Could not delete raw session: {exc}") from exc
+    return SessionAck(stream_id=key, status="deleted" if removed else "not_found")
 
 
 # --------------------------------------------------------------------------- #
