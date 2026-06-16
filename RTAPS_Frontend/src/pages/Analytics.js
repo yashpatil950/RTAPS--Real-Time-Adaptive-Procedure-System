@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { getSummary, loadAnalytics, getAllParticipants } from '../data/analyticsStorage';
-import { Activity, Timer, ListChecks, Info, Download, ChevronRight, Lightbulb } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { getSummary, loadAnalytics, getAllParticipants, deleteSessions } from '../data/analyticsStorage';
+import { Activity, Timer, ListChecks, Info, Download, ChevronRight, Lightbulb, Trash2 } from 'lucide-react';
 import { procedures } from '../data/procedures';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 
@@ -52,6 +52,12 @@ const WORKLOAD_BADGE = {
 };
 
 const secOrDash = (v) => (v == null ? '—' : `${v}s`);
+
+// Session mode: 'adaptive' (eye-tracking + ML + adaptive guidance) or
+// 'non-adaptive' (plain instructions). Defaults to adaptive for older sessions
+// recorded before the mode was tracked.
+const getMode = (s) => (s.metadata && s.metadata.mode) || s.mode || 'adaptive';
+const isAdaptiveSession = (s) => getMode(s) !== 'non-adaptive';
 
 // Aggregate per-second workload from a session's steps. The live system records
 // `highPredictionCount` (seconds the displayed workload was "high") and
@@ -111,34 +117,35 @@ const Analytics = () => {
     }
   }, []);
 
-  useEffect(() => {
-    const loadData = async () => {
-      try {
-        setIsLoading(true);
-        setError(null);
-        const [summaryData, analyticsData] = await Promise.all([
-          getSummary(),
-          loadAnalytics()
-        ]);
-        setSummary(summaryData || { total: 0, avgTimeSec: 0, byProcedure: {} });
-        setAnalytics(analyticsData || { sessions: [] });
-        if (isAdmin) {
-          const participantsData = await getAllParticipants();
-          setParticipants(participantsData || []);
-        } else {
-          setParticipants([]);
-        }
-      } catch (e) {
-        console.error('Error loading analytics:', e);
-        setError('Failed to load analytics data. Please try again.');
-      } finally {
-        setIsLoading(false);
+  const loadData = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      setError(null);
+      const [summaryData, analyticsData] = await Promise.all([
+        getSummary(),
+        loadAnalytics()
+      ]);
+      setSummary(summaryData || { total: 0, avgTimeSec: 0, byProcedure: {} });
+      setAnalytics(analyticsData || { sessions: [] });
+      if (isAdmin) {
+        const participantsData = await getAllParticipants();
+        setParticipants(participantsData || []);
+      } else {
+        setParticipants([]);
       }
-    };
+    } catch (e) {
+      console.error('Error loading analytics:', e);
+      setError('Failed to load analytics data. Please try again.');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [isAdmin]);
+
+  useEffect(() => {
     if (currentUser) {
       loadData();
     }
-  }, [currentUser, isAdmin]);
+  }, [currentUser, loadData]);
 
   const [selectedProcedureId, setSelectedProcedureId] = useState('all');
   const [selectedRange, setSelectedRange] = useState('all');
@@ -296,7 +303,7 @@ const Analytics = () => {
 
   const handleExportCSV = () => {
     const headers = [
-      'SessionId', 'CompletedAt', 'Participant', 'Procedure', 'Train', 'TotalTimeSec',
+      'SessionId', 'CompletedAt', 'Participant', 'Procedure', 'Mode', 'Train', 'TotalTimeSec',
       'StepNumber', 'StepTitle', 'TimeSpentSec',
       'WorkloadHigh', 'AdaptationShown', 'FinalWorkloadLevel', 'TimeToAdaptationSec',
       'MaxHighProba', 'HighSeconds', 'LowSeconds', 'PredictionSeconds', 'PctHigh', 'PctLow',
@@ -313,6 +320,7 @@ const Analytics = () => {
           new Date(getCompletedAtMs(s)).toISOString(),
           resolveParticipant(s),
           s.procedureName || getProcedureName(s.procedureId),
+          getMode(s),
           s.trainNumber ? `Train ${s.trainNumber}` : 'N/A',
           s.totalTimeSec || 0,
           st.stepNumber,
@@ -341,6 +349,29 @@ const Analytics = () => {
     a.download = 'rtaps_analytics.csv';
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  // Permanently delete the currently selected sessions (works for both adaptive
+  // and non-adaptive sessions), then refresh the list.
+  const handleDeleteSelected = async () => {
+    const targets = selectedSessions;
+    if (targets.length === 0) return;
+    const n = targets.length;
+    if (!window.confirm(
+      `Delete ${n} selected session${n > 1 ? 's' : ''}? This permanently removes the data and cannot be undone.`
+    )) {
+      return;
+    }
+    try {
+      setIsLoading(true);
+      await deleteSessions(targets.map((s) => s.sessionId || s.id));
+      setSelectedSessionIds(new Set());
+      await loadData();
+    } catch (e) {
+      console.error('Error deleting sessions:', e);
+      setError('Failed to delete the selected sessions. Please try again.');
+      setIsLoading(false);
+    }
   };
 
   // Always show most-recent sessions first.
@@ -436,10 +467,19 @@ const Analytics = () => {
               </select>
             </div>
           )}
-          <div className="flex items-end pr-2">
-            <button onClick={handleExportCSV} className="w-full flex items-center justify-center border rounded px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700">
+          <div className="flex items-end gap-2 pr-2">
+            <button onClick={handleExportCSV} className="flex-1 flex items-center justify-center border rounded px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700">
               <span className="mr-2">Export CSV</span>
               <Download className="w-4 h-4" />
+            </button>
+            <button
+              onClick={handleDeleteSelected}
+              disabled={selectedSessions.length === 0}
+              title="Delete selected sessions"
+              className="flex items-center justify-center gap-1 border border-red-200 rounded px-3 py-2 bg-red-50 hover:bg-red-100 text-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span className="text-sm">Delete{selectedSessions.length ? ` (${selectedSessions.length})` : ''}</span>
             </button>
           </div>
         </div>
@@ -596,6 +636,7 @@ const Analytics = () => {
                   <th className="px-3 py-2 whitespace-nowrap">Completed</th>
                   {isAdmin && <th className="px-3 py-2 whitespace-nowrap">Participant</th>}
                   <th className="px-3 py-2 whitespace-nowrap">Procedure</th>
+                  <th className="px-3 py-2 whitespace-nowrap">Mode</th>
                   <th className="px-3 py-2 whitespace-nowrap">Train</th>
                   <th className="px-3 py-2 whitespace-nowrap">Total Time</th>
                   <th className="px-3 py-2 whitespace-nowrap">
@@ -644,7 +685,8 @@ const Analytics = () => {
                   const guidanceRate = steps.length ? Math.round((100 * guidanceCount) / steps.length) : 0;
                   const isExpanded = expandedSessionIds.has(key);
                   const wl = sessionWorkload(s);
-                  const colCount = isAdmin ? 9 : 8;
+                  const adaptive = isAdaptiveSession(s);
+                  const colCount = isAdmin ? 10 : 9;
                   return (
                     <React.Fragment key={key}>
                       <tr className="border-t border-gray-200">
@@ -681,6 +723,13 @@ const Analytics = () => {
                           </td>
                         )}
                         <td className="px-3 py-3 text-gray-700 whitespace-nowrap">{s.procedureName || getProcedureName(s.procedureId)}</td>
+                        <td className="px-3 py-3 whitespace-nowrap">
+                          {adaptive ? (
+                            <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800">Adaptive</span>
+                          ) : (
+                            <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-200 text-gray-700">Non-adaptive</span>
+                          )}
+                        </td>
                         <td className="px-3 py-3 text-gray-700 whitespace-nowrap">
                           {s.trainNumber ? (
                             <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
@@ -696,10 +745,16 @@ const Analytics = () => {
                         </td>
                         <td className="px-3 py-3 text-gray-700">{steps.length}</td>
                         <td className="px-3 py-3 text-gray-700 whitespace-nowrap">
-                          <span className={`font-medium ${guidanceCount > 0 ? 'text-orange-700' : 'text-gray-500'}`}>
-                            {guidanceCount}/{steps.length}
-                          </span>
-                          <span className="text-gray-400 text-xs ml-1">({guidanceRate}%)</span>
+                          {adaptive ? (
+                            <>
+                              <span className={`font-medium ${guidanceCount > 0 ? 'text-orange-700' : 'text-gray-500'}`}>
+                                {guidanceCount}/{steps.length}
+                              </span>
+                              <span className="text-gray-400 text-xs ml-1">({guidanceRate}%)</span>
+                            </>
+                          ) : (
+                            <span className="text-gray-400 text-xs">N/A</span>
+                          )}
                         </td>
                       </tr>
                       {isExpanded && (

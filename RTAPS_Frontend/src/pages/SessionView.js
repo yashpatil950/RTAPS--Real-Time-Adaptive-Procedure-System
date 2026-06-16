@@ -44,7 +44,12 @@ const SessionView = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const trainNumber = parseInt(searchParams.get('train')) || 1; // Default to Train 1 if not provided
-  
+  // Procedure mode: 'adaptive' (eye-tracking + ML + adaptive guidance) or
+  // 'non-adaptive' (plain static instructions; no calibration, no ML, no adapted
+  // guidance). Defaults to adaptive so existing links keep working.
+  const modeParam = (searchParams.get('mode') || 'adaptive').toLowerCase();
+  const isAdaptive = modeParam !== 'nonadaptive' && modeParam !== 'non-adaptive';
+
   const procedure = getProcedureByTrain(procedureId, trainNumber);
   
   // Redirect to dashboard if procedure not found
@@ -59,8 +64,10 @@ const SessionView = () => {
   // immediately usable for offline rehearsal.
   const streamingEnabled =
     typeof window !== 'undefined' && isStreamingIntegrationEnabled();
+  // Non-adaptive runs skip calibration entirely; adaptive runs require it only
+  // when streaming is enabled.
   const [calibrationComplete, setCalibrationComplete] = useState(
-    !streamingEnabled
+    !streamingEnabled || !isAdaptive
   );
   // Defer the procedure clock until AFTER calibration finishes — that way step
   // 1's elapsed time starts at 0, not at "120 s into the page mount".
@@ -107,6 +114,9 @@ const SessionView = () => {
       setStreamingHookReady(false);
       return undefined;
     }
+    // Both modes open a backend session so the raw eye data is captured and
+    // archived. Non-adaptive runs simply skip calibration and predictions
+    // (handled separately below); the session still starts and ends here.
     const enabled = isStreamingIntegrationEnabled();
     const sid = ensureStoredStreamId(procedure.id, trainNumber).trim();
     if (!enabled || !sid) {
@@ -134,6 +144,7 @@ const SessionView = () => {
           procedureId: procedure.id,
           participantId: String(participantId),
           nStepsTotal: procedure.steps.length,
+          mode: isAdaptive ? 'adaptive' : 'non-adaptive',
         });
         if (cancelled) return;
 
@@ -193,6 +204,9 @@ const SessionView = () => {
   // smoothed level).
   useEffect(() => {
     if (!procedure || typeof window === 'undefined') return undefined;
+    // Only adaptive runs consume predictions; non-adaptive records raw data but
+    // shows no workload-driven guidance.
+    if (!isAdaptive) return undefined;
     const enabled = isStreamingIntegrationEnabled();
     const sid = ensureStoredStreamId(procedure.id, trainNumber).trim();
     if (!enabled || !sid || !streamingHookReady) return undefined;
@@ -253,7 +267,7 @@ const SessionView = () => {
     );
 
     return cleanup;
-  }, [procedure, trainNumber, streamingHookReady]);
+  }, [procedure, trainNumber, streamingHookReady, isAdaptive]);
 
   // Initialize step start times — only AFTER calibration completes, so the
   // first step's elapsed time starts at 0 (not at "120 s into the page mount").
@@ -364,8 +378,9 @@ const SessionView = () => {
               steps: stepSummaries,
               trainNumber: trainNumber,
               metadata: {
-                // Session-level adaptation summary for the Analytics page.
-                adaptationMode: streamingEnabled ? 'workload' : 'time',
+                // Session-level summary for the Analytics page.
+                mode: isAdaptive ? 'adaptive' : 'non-adaptive',
+                adaptationMode: isAdaptive ? (streamingEnabled ? 'workload' : 'time') : 'none',
                 stepsWithAdaptation,
                 stepsWithPredictions,
                 totalSteps: stepSummaries.length,
@@ -443,7 +458,7 @@ const SessionView = () => {
 
   // Show the calibration overlay until the operator has sat through the
   // baseline period. Skips entirely if streaming integration is disabled.
-  const showCalibration = streamingEnabled && !calibrationComplete;
+  const showCalibration = streamingEnabled && isAdaptive && !calibrationComplete;
   const streamIdForCalibration = streamingEnabled
     ? ensureStoredStreamId(procedure.id, trainNumber).trim()
     : '';
@@ -484,7 +499,7 @@ const SessionView = () => {
 
       {/* Session Timer */}
       <div className="tablet-card text-center">
-        {streamingBanner ? (
+        {isAdaptive && streamingBanner ? (
           <div className="mb-4 rounded-lg border border-sky-200 bg-sky-50 px-4 py-2 text-sm text-sky-900 flex flex-wrap items-center justify-between gap-2">
             <span className="font-medium">
               Streaming ML: {latestPrediction ? 'live' : 'active'}
@@ -611,7 +626,7 @@ const SessionView = () => {
                  *  - On the next step, the latch is cleared and the
                  *    "low → 3 s of high → high" cycle restarts.
                  */}
-                {useWorkloadFeedback && (() => {
+                {isAdaptive && useWorkloadFeedback && (() => {
                   // Only show guidance for the active step
                   if (!isActiveStep) return null;
 

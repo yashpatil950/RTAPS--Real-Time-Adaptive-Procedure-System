@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { Activity, BarChart3, Radio, User, LogOut, Users } from 'lucide-react';
+import { Activity, BarChart3, Radio, User, LogOut, Users, Database } from 'lucide-react';
 
 const Header = () => {
   const location = useLocation();
@@ -38,7 +38,8 @@ const Header = () => {
   const navItems = [
     { path: '/', label: 'Dashboard', icon: Activity },
     { path: '/streaming', label: 'Live ML', icon: Radio },
-    { path: '/analytics', label: 'Analytics', icon: BarChart3 }
+    { path: '/analytics', label: 'Analytics', icon: BarChart3 },
+    { path: '/raw-data', label: 'Raw Data', icon: Database }
   ];
 
   // Add Users tab for admins

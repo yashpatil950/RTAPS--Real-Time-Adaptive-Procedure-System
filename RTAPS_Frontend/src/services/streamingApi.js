@@ -56,7 +56,7 @@ export async function getSessionState(streamId) {
   return streamingFetch(`/session/${encodeURIComponent(streamId)}/state`);
 }
 
-export async function streamingSessionStart({ streamId, procedureId, participantId, nStepsTotal }) {
+export async function streamingSessionStart({ streamId, procedureId, participantId, nStepsTotal, mode }) {
   return streamingFetch('/session/start', {
     method: 'POST',
     body: JSON.stringify({
@@ -64,6 +64,7 @@ export async function streamingSessionStart({ streamId, procedureId, participant
       procedure_id: procedureId,
       participant_id: participantId || undefined,
       n_steps_total: nStepsTotal ?? undefined,
+      mode: mode || undefined,
     }),
   });
 }
@@ -138,6 +139,31 @@ export function subscribePredictions(streamId, onMessage, onError) {
       es.close();
     }
   };
+}
+
+// ---- Raw eye-data archive --------------------------------------------------
+
+/** List archived raw sessions (metadata index). */
+export async function listRawSessions() {
+  return streamingFetch('/raw_sessions');
+}
+
+/** Direct download URL for one raw session file (redirects to S3 or streams local). */
+export function rawSessionDownloadUrl(key) {
+  const encoded = String(key)
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/');
+  return `${getStreamingBaseUrl()}/raw_sessions/${encoded}/download`;
+}
+
+/** Permanently delete one archived raw session. */
+export async function deleteRawSession(key) {
+  const encoded = String(key)
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/');
+  return streamingFetch(`/raw_sessions/${encoded}`, { method: 'DELETE' });
 }
 
 export function getStoredStreamId() {

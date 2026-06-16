@@ -63,6 +63,16 @@ export async function appendCompletedSession(sessionSummary) {
   }
 }
 
+// Delete specific sessions by id (used by the Analytics page delete action).
+// Works for any session regardless of mode (adaptive or non-adaptive).
+export async function deleteSessions(sessionIds) {
+  const ids = (sessionIds || []).filter(Boolean);
+  for (const id of ids) {
+    await apiService.deleteSession(id);
+  }
+  return ids.length;
+}
+
 // Get analytics summary from API
 export async function getSummary() {
   try {

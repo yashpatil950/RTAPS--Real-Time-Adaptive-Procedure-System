@@ -7,6 +7,7 @@ import SessionView from "./pages/SessionView";
 import Analytics from "./pages/Analytics";
 import Users from "./pages/Users";
 import StreamingDashboard from "./pages/StreamingDashboard";
+import RawData from "./pages/RawData";
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -67,6 +68,7 @@ function App() {
               <Route path="/" element={<Dashboard />} />
               <Route path="/session/:procedureId" element={<SessionView />} />
               <Route path="/analytics" element={<Analytics />} />
+              <Route path="/raw-data" element={<RawData />} />
               <Route path="/users" element={<Users />} />
               <Route path="/streaming" element={<StreamingDashboard />} />
             </Routes>

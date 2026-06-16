@@ -8,6 +8,8 @@ const Dashboard = () => {
   const [showSystemStatus, setShowSystemStatus] = useState(true);
   const [selectedTrain, setSelectedTrain] = useState(null); // null, 1, or 2
   const [procedures, setProcedures] = useState([]);
+  // Procedure id awaiting an adaptive / non-adaptive mode choice (null = modal closed).
+  const [pendingProcedureId, setPendingProcedureId] = useState(null);
 
   // Load system status visibility preference from localStorage
   useEffect(() => {
@@ -35,7 +37,14 @@ const Dashboard = () => {
 
   const handleStartSession = (procedureId) => {
     if (!selectedTrain) return;
-    navigate(`/session/${procedureId}?train=${selectedTrain}`);
+    // Ask the operator which mode to run before launching the session.
+    setPendingProcedureId(procedureId);
+  };
+
+  const startWithMode = (mode) => {
+    if (!selectedTrain || pendingProcedureId == null) return;
+    navigate(`/session/${pendingProcedureId}?train=${selectedTrain}&mode=${mode}`);
+    setPendingProcedureId(null);
   };
 
   const handleViewProcedure = (procedureId) => {
@@ -217,6 +226,50 @@ const Dashboard = () => {
           <p className="text-gray-600">Sub-step Display</p>
         </div>
       </div>
+
+      {/* Adaptive / non-adaptive mode chooser */}
+      {pendingProcedureId !== null && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={() => setPendingProcedureId(null)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-xl max-w-md w-full p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold text-gray-900 mb-1">Choose procedure mode</h3>
+            <p className="text-sm text-gray-600 mb-4">How should this procedure run?</p>
+            <div className="space-y-3">
+              <button
+                onClick={() => startWithMode('adaptive')}
+                className="w-full text-left p-4 rounded-lg border-2 border-blue-200 hover:border-blue-500 hover:bg-blue-50 transition-all"
+              >
+                <div className="font-semibold text-gray-900">Adaptive procedure</div>
+                <div className="text-sm text-gray-600">
+                  Uses eye-tracking and the ML model. Includes a short calibration and reveals extra
+                  guidance when high workload is detected.
+                </div>
+              </button>
+              <button
+                onClick={() => startWithMode('nonadaptive')}
+                className="w-full text-left p-4 rounded-lg border-2 border-gray-200 hover:border-gray-400 hover:bg-gray-50 transition-all"
+              >
+                <div className="font-semibold text-gray-900">Non-adaptive procedure</div>
+                <div className="text-sm text-gray-600">
+                  Shows the standard step instructions only. No eye-tracking, no calibration, and no
+                  adaptive guidance.
+                </div>
+              </button>
+            </div>
+            <button
+              onClick={() => setPendingProcedureId(null)}
+              className="mt-4 w-full tablet-button bg-gray-100 text-gray-700 hover:bg-gray-200"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
