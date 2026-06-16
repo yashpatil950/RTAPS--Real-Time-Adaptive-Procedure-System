@@ -1,0 +1,24 @@
+*   [33m356569b[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m Merge branch 'main' of https://github.com/yashpatil950/RTAPS--Real-Time-Adaptive-Procedure-System
+[31m|[m[32m\[m  
+[31m|[m * [33m9918925[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m adding non adaptive feature
+[31m|[m * [33m372efc6[m uploading files
+[31m|[m * [33m27c51bb[m uploading files
+* [32m|[m [33mc1f281c[m Merge branch 'main' of https://github.com/yashpatil950/RTAPS--Real-Time-Adaptive-Procedure-System
+[33m|[m[32m\[m[32m|[m 
+[33m|[m * [33m8429dd0[m Adding details in Analytics
+* [34m|[m [33ma9cdc26[m Merge branch 'main' of https://github.com/yashpatil950/RTAPS--Real-Time-Adaptive-Procedure-System
+[35m|[m[34m\[m[34m|[m 
+[35m|[m * [33ma3135cc[m Adding Analytics features
+[35m|[m * [33mb291496[m updating ML
+* [36m|[m [33m8779362[m updating ML
+[36m|[m[36m/[m  
+* [33m4a48403[m changing ML x labels
+* [33m3ffc20c[m Adding optuna ML
+* [33m3d81529[m Updating ML logic
+* [33m54567b9[m reducing clutter in UI for operators
+* [33me25bbf6[m adding ML fixes
+* [33m7545193[m adding ML fixes
+* [33ma9f8ca6[m adding ML fixes
+* [33m6aeae0e[m Making changes in ML architecture
+* [33m08345a3[m adding fixation script
+* [33mc278210[m adding fixation

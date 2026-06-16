@@ -59,7 +59,14 @@ FEATURE_TRAINING_BOUNDS: dict[str, tuple[float, float]] = {
     "pupil_pcps_mean":          (-0.29, 1.04),
     "pupil_diam_slope":         (-0.13, 0.13),
     "blink_rate_30s":           (0.0,   21.0),
-    "fixation_dur_mean_ms":     (100.0, 211.0),
+    # fixation_dur_mean_ms is intentionally NOT bounded here — the live Online
+    # Fixation Detector rails durations at ~300 ms (Pupil's Maximum Duration
+    # setting), well above the offline-export training 99th-%ile of 211 ms, so
+    # clamping it pinned the single most-important feature (~42% of model
+    # importance) permanently at the top of the training range. The live value
+    # is now passed through unclamped. NOTE: this does not by itself change the
+    # "always high" behaviour — see the root-cause notes; the model needs
+    # retraining with matched fixation features.
 }
 
 
