@@ -25,8 +25,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Order MUST match `FEATURE_COLS` in `ML Algorithm/scripts/07d_train_rf_tuned.py`.
-# Sensor features only — no step/procedure leakage.
+# Order MUST match `FEATURE_COLS` in `ML Algorithm/scripts/07d_train_rf_tuned.py`
+# (the Optuna-tuned Random Forest, v5). Sensor features only — no step/procedure
+# leakage. `fixation_dur_mean_ms` is included as a model input here.
+#
+# NOTE: live `fixation_dur_mean_ms` is currently a near-constant (~302 ms) because
+# Pupil Capture's Online Fixation Detector "Maximum Duration" caps every fixation
+# there. For this feature to actually inform the RF, raise that cap in Pupil
+# Capture so live fixations vary across their natural 100-400 ms range; otherwise
+# the model extrapolates the railed value to "high".
 FEATURE_NAMES: tuple[str, ...] = (
     "pupil_pcps_mean",
     "pupil_diam_slope",

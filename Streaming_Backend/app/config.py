@@ -59,32 +59,31 @@ class Settings:
     # ---- Workload smoother -----------------------------------------------
     # Consecutive seconds the new candidate label must hold before the
     # displayed instruction level changes. Lower values = more responsive UI
-    # (instructions change ~3 s after the model first sees the new level),
+    # (instructions change ~N s after the model first sees the new level),
     # higher values = more stable but laggier. Direction-guarded one step at
     # a time (low ↔ medium ↔ high).
-    workload_smoother_stability_s: int = _env_int("WORKLOAD_SMOOTHER_STABILITY_S", 3)
+    #
+    # Set to 8 s: an adaptation is only shown after the model predicts the new
+    # level (e.g. "high") continuously for 8 s, filtering out brief spikes.
+    workload_smoother_stability_s: int = _env_int("WORKLOAD_SMOOTHER_STABILITY_S", 8)
 
     # ---- Feature sanitization (train/serve skew guard) ------------------
     # Training data (`X_window.parquet`) has tight per-feature distributions
-    # (computed from offline Pupil-player exports). Two live features
-    # consistently drift outside those bounds:
+    # (computed from offline Pupil-player exports). The clip/mask strategy
+    # only acts on the features still listed in `FEATURE_TRAINING_BOUNDS`
+    # (pupil_pcps_mean, pupil_diam_slope, blink_rate_30s).
     #
-    #     feature                     training 99th   live typical
-    #     ---------------------------------------------------------
-    #     fixation_dur_mean_ms        211             ~300
-    #     blink_rate_30s              21              ~30–50   (more
-    #         blinks than the research-subject training population)
-    #
-    # The model's permutation importance is fairly balanced across the
-    # four sensor features, so no single feature dominates and the old
-    # "lock to HIGH on OOD fixations" failure mode is mild.
+    # NOTE: `fixation_dur_mean_ms` was REMOVED from both the model (v6) and the
+    # bounds table. It had a severe train/serve skew — the live Online Fixation
+    # Detector rails durations at its ~300 ms "Maximum Duration" vs the training
+    # 100-211 ms — and as the old model's dominant feature it forced "high" on
+    # every window. It is now computed for display only and never sanitized.
     #
     # Strategy options:
     #   "clip" (DEFAULT) — clamp out-of-distribution values to the
     #       [1st-%ile, 99th-%ile] training envelope. Preserves the
     #       *direction* of each feature (high blink stays high, just
-    #       capped at 21 instead of 49), which is what we want when
-    #       the model has no single dominant feature.
+    #       capped at 21 instead of 49).
     #   "mask" — replace OOD values with NaN. SimpleImputer fills with
     #       the training median (class-neutral) — useful only if a
     #       feature is producing nonsense (e.g. a stuck detector),
@@ -99,7 +98,7 @@ class Settings:
     # ---- Model -----------------------------------------------------------
     model_path: Path = _env_path(
         "MODEL_PATH",
-        str(Path(__file__).resolve().parents[2] / "ML Algorithm" / "models" / "v5_rf_tuned.joblib"),
+        str(Path(__file__).resolve().parents[2] / "ML Algorithm" / "models" / "v7_rf_fixation3.joblib"),
     )
 
     # ---- Optional remote inference (forward features, get back prediction)

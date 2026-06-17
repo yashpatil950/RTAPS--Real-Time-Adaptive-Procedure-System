@@ -1,0 +1,31 @@
+{
+  "model_kind": "soft_voting_rf_blend",
+  "fixation_weight": 0.1,
+  "feature_columns": [
+    "pupil_pcps_mean",
+    "pupil_diam_slope",
+    "blink_rate_30s",
+    "fixation_dur_mean_ms"
+  ],
+  "label_meta": {
+    "method": "largest_gap_with_balance_floor",
+    "chosen_boundary": 0.3277,
+    "class_distribution_step_level": {
+      "low": 27,
+      "high": 8
+    }
+  },
+  "loso": {
+    "cohen_kappa": -0.022723600650581544,
+    "macro_f1": 0.4726092800435916,
+    "balanced_accuracy": 0.4882853720328315
+  },
+  "live_responsiveness": {
+    "frac_high": 0.3541666666666667,
+    "p_high_min": 0.23237300689291693,
+    "p_high_mean": 0.48230339308835485,
+    "p_high_max": 0.8751819368976865
+  },
+  "n_windows": 18220,
+  "n_participants": 11
+}

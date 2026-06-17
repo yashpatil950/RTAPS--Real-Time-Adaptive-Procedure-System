@@ -313,8 +313,8 @@ class InferenceLoop:
         if step_changed:
             smoother.force_level("low")
             log.info(
-                "[%s] step %d started — workload display reset to LOW (3 s of model 'high' required to upgrade)",
-                stream_id, step_num,
+                "[%s] step %d started — workload display reset to LOW (%d s of continuous model 'high' required to upgrade)",
+                stream_id, step_num, self._smoother_stability_s,
             )
         stable_label = smoother.update(raw_label)
 

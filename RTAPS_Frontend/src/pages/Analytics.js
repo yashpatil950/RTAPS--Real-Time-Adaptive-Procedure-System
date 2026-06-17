@@ -35,11 +35,22 @@ const getCompletedAtMs = (s) => {
   return 0;
 };
 
-// Did the ML model flag high workload on this step (so adaptive guidance was
-// revealed)? Prefer the workload fields recorded by the live system; fall back
-// to the legacy time-threshold proxy for sessions saved before workload-driven
-// adaptation existed.
+// A step only counts as a real high-workload adaptation if the displayed
+// workload was high for at least this many seconds — matching the backend
+// smoother's "continuous high for N s before adapting" window
+// (WORKLOAD_SMOOTHER_STABILITY_S). This stops a brief high blip (e.g. 3 s out
+// of a 30 s step) from badging the step "high" or counting as an adaptation.
+const ADAPTATION_MIN_HIGH_SECONDS = 8;
+
+// Did the ML model sustain high workload long enough on this step that adaptive
+// guidance genuinely kicked in? Prefer the per-second counts recorded by the
+// live system (require >= ADAPTATION_MIN_HIGH_SECONDS of displayed high); fall
+// back to the legacy recorded flag / time-threshold proxy only for sessions
+// saved without per-second counts.
 const stepAdapted = (st) => {
+  if ((st.predictionCount || 0) > 0) {
+    return (st.highPredictionCount || 0) >= ADAPTATION_MIN_HIGH_SECONDS;
+  }
   if (typeof st.adaptationShown === 'boolean') return st.adaptationShown;
   if (typeof st.workloadReachedHigh === 'boolean') return st.workloadReachedHigh;
   return !!st.subStepsShown;
@@ -600,7 +611,7 @@ const Analytics = () => {
             </div>
             <p className="text-xs text-gray-500 mt-2">
               Of the seconds monitored on each step, the share the model judged high workload (averaged over the selected sessions).
-              This is finer than the adaptation rate, which only asks whether high was ever reached.
+              This is finer than the adaptation rate, which only asks whether high was sustained long enough (≥8s) to trigger adaptation.
             </p>
           </div>
         </>
@@ -781,7 +792,13 @@ const Analytics = () => {
                                 <tbody>
                                   {steps.slice().sort((a, b) => (a.stepNumber || 0) - (b.stepNumber || 0)).map((st) => {
                                     const adapted = stepAdapted(st);
-                                    const lvl = st.finalWorkloadLevel || (st.workloadReachedHigh ? 'high' : 'low');
+                                    // Keep the Workload badge consistent with the adaptation rule: a step
+                                    // is "high" only when high was sustained long enough to adapt; a brief
+                                    // blip (mostly-low step) reads "low". Legacy sessions without per-second
+                                    // counts fall back to the recorded final level.
+                                    const lvl = (st.predictionCount || 0) > 0
+                                      ? (adapted ? 'high' : 'low')
+                                      : (st.finalWorkloadLevel || (st.workloadReachedHigh ? 'high' : 'low'));
                                     const high = st.highPredictionCount || 0;
                                     const total = st.predictionCount || 0;
                                     const low = Math.max(0, total - high);
@@ -806,7 +823,7 @@ const Analytics = () => {
                                             <span className="text-gray-400">No</span>
                                           )}
                                         </td>
-                                        <td className="py-1 pr-4 text-gray-700">{secOrDash(st.timeToAdaptationSec)}</td>
+                                        <td className="py-1 pr-4 text-gray-700">{adapted ? secOrDash(st.timeToAdaptationSec) : '—'}</td>
                                         <td className="py-1 pr-4 text-gray-700">
                                           {st.maxHighProba == null ? '—' : `${Math.round(st.maxHighProba * 100)}%`}
                                         </td>

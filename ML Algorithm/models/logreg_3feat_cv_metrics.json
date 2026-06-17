@@ -1,0 +1,59 @@
+{
+  "model_kind": "logreg_class_balanced",
+  "feature_columns": [
+    "pupil_pcps_mean",
+    "pupil_diam_slope",
+    "blink_rate_30s"
+  ],
+  "label_source": "p_normalized_largest_gap",
+  "label_meta": {
+    "method": "largest_gap_with_balance_floor",
+    "chosen_boundary": 0.3277,
+    "n_steps_total": 35,
+    "class_distribution_step_level": {
+      "low": 27,
+      "high": 8
+    }
+  },
+  "n_windows": 18220,
+  "n_participants": 11,
+  "class_distribution_window": {
+    "high": 9906,
+    "low": 8314
+  },
+  "loso": {
+    "accuracy": 0.5896816684961581,
+    "balanced_accuracy": 0.5780390032434303,
+    "macro_f1": 0.5753428764228239,
+    "cohen_kappa": 0.15877267278838525
+  },
+  "five_fold_group": {
+    "accuracy": 0.5842480790340285,
+    "balanced_accuracy": 0.572935716009537,
+    "macro_f1": 0.5704020069987528,
+    "cohen_kappa": 0.14827762829848679
+  },
+  "confusion_5fold": {
+    "labels": [
+      "low",
+      "high"
+    ],
+    "matrix": [
+      [
+        3687,
+        4627
+      ],
+      [
+        2948,
+        6958
+      ]
+    ]
+  },
+  "coefficients": {
+    "pupil_pcps_mean": -0.2453238264922378,
+    "pupil_diam_slope": -0.006568326779372308,
+    "blink_rate_30s": 0.5322429506343248
+  },
+  "coef_positive_class": "low",
+  "participants_above_chance": "9/11"
+}
