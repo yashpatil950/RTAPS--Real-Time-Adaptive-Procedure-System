@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { Activity, BarChart3, Radio, User, LogOut, Users, Database } from 'lucide-react';
+import EyeTrackerStatus from './EyeTrackerStatus';
 
 const Header = () => {
   const location = useLocation();
@@ -87,8 +88,11 @@ const Header = () => {
 
           {/* User Info and Actions */}
           <div className="flex items-center space-x-4">
+            {/* Eye tracker connection status */}
+            <EyeTrackerStatus />
+
             {/* Connection Status */}
-            <div className="flex items-center space-x-2">
+            <div className="hidden sm:flex items-center space-x-2">
               <div className="w-2 h-2 bg-green-500 rounded-full"></div>
               <span className="text-sm text-green-600 font-medium">Ready</span>
             </div>

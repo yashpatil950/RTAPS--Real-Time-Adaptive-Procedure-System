@@ -36,7 +36,7 @@ const train1Procedures = [
         stepNumber: 1,
         title: "Take a sample from the oil outlet of the bulk oil treater. The sample tap is located just upstream of LCV – 301A/302A/303A. (Last number correlates to train number).",
         description: "Extract oil sample from bulk oil treater",
-        instructions: "Ensure that the centrifuge tubes are cleared and cleaned properly before starting this step.",
+        instructions: "",
         timeThreshold: 43,
         subSteps: [
           {
@@ -54,7 +54,7 @@ const train1Procedures = [
         stepNumber: 2,
         title: "Samples should be taken in two 200 ml certified centrifuge tubes. Fill tubes to the 100 ml mark.",
         description: "Take samples in certified centrifuge tubes",
-        instructions: "Vapors may ignite, causing flashing fire. Wear proper PPE (Gloves and safety glasses). Use Gas Monitor to detect LEL.",
+        instructions: "Vapors may ignite, causing flashing fire. Wear proper PPE (Gloves and safety glasses). Note: Vapors may ignite, causing flashing fire. Use Gas Monitor to detect LEL.",
         timeThreshold: 80,
         subSteps: [
           {
@@ -144,7 +144,7 @@ const train1Procedures = [
         stepNumber: 8,
         title: "If your results are questionable, take two more samples.",
         description: "Check if results are questionable",
-        instructions: "Note: Samples that are further than .3 ml apart are questionable.",
+        instructions: "",
         timeThreshold: 4,
         subSteps: []
       }
@@ -161,7 +161,7 @@ const train1Procedures = [
         stepNumber: 1,
         title: "Have CRO place ILIC - 101 in Manual Control.",
         description: "Request manual control from CRO",
-        instructions: "Grab radios and hand tools as required before starting this step.",
+        instructions: "",
         timeThreshold: 27,
         subSteps: []
       },
@@ -293,7 +293,7 @@ const train1Procedures = [
       {
         id: 33,
         stepNumber: 11,
-        title: "Open manual column valves M101 - 11. Upper isolation valve on level column.",
+        title: "Open manual column valves M101 - 11. Upper isolation valve on level column",
         description: "Open upper isolation valve",
         instructions: "",
         timeThreshold: 33,
@@ -311,7 +311,7 @@ const train1Procedures = [
       {
         id: 34,
         stepNumber: 12,
-        title: "Open manual column valves M101 - 9. Lower isolation valve on level column.",
+        title: "Open manual column valves M101 - 9. Lower isolation valve on level column",
         description: "Open lower isolation valve",
         instructions: "",
         timeThreshold: 13,
@@ -345,7 +345,7 @@ const train1Procedures = [
       {
         id: 41,
         stepNumber: 1,
-        title: "Notify Control Room.",
+        title: "Notify Control Room",
         description: "Inform control room of testing.",
         instructions: "Note: Have communication plan in place. Cover Testing Process and any needed documentation.",
         timeThreshold: 34,
@@ -354,7 +354,7 @@ const train1Procedures = [
       {
         id: 42,
         stepNumber: 2,
-        title: "Have CRO place PST-111 in Override/Bypass.",
+        title: "Have CRO place PST-111 in Override/Bypass",
         description: "Request override/bypass from CRO.",
         instructions: "Note: Have CRO verify when shutdown is in bypass.",
         timeThreshold: 104,
@@ -372,7 +372,7 @@ const train1Procedures = [
       {
         id: 43,
         stepNumber: 3,
-        title: "Close PST-111 isolation valves.",
+        title: "Close PST-111 isolation valves",
         description: "Close isolation valves.",
         instructions: "",
         timeThreshold: 111,
@@ -507,7 +507,7 @@ const train1Procedures = [
       {
         id: 55,
         stepNumber: 11,
-        title: "Open PST-111 isolation valve.",
+        title: "Open PST-111 isolation valve",
         description: "Open isolation valve.",
         instructions: "",
         timeThreshold: 24,
@@ -525,7 +525,7 @@ const train1Procedures = [
       {
         id: 56,
         stepNumber: 12,
-        title: "Verify Pressure increases to safe operating limits of PST.",
+        title: "Verify Pressure increases to safe operating limits of PST",
         description: "Verify pressure limits.",
         instructions: "Note: Have CRO verify when shutdown is in reset. Notify CRO testing is complete.",
         timeThreshold: 27,
@@ -584,7 +584,8 @@ const train2Procedures = deepClone(train1Procedures).map(proc => {
   }
   
   if (proc.id === 3) { // Pressure Testing procedure
-    // Replace 111 with 112 in steps 2, 3, 11
+    // Train 2 work instruction: PST-111 -> PST-112 in steps 2, 3, 11; and step 10
+    // uses a lowercase "(close test valve if required)".
     cloned.steps = cloned.steps.map(step => {
       if (step.stepNumber === 2 || step.stepNumber === 3 || step.stepNumber === 11) {
         return {
@@ -592,12 +593,29 @@ const train2Procedures = deepClone(train1Procedures).map(proc => {
           title: step.title.replace(/111/g, '112')
         };
       }
+      if (step.stepNumber === 10) {
+        return {
+          ...step,
+          title: 'Disconnect test pressure source. (close test valve if required)'
+        };
+      }
       return step;
     });
   }
   
-  // Centrifuge (proc.id === 1) - No changes needed
-  
+  if (proc.id === 1) { // Centrifuge — Train 2 work instruction differs from Train 1 on the safety notes for steps 3, 5, and 8
+    const t2CentrifugeInstructions = {
+      3: 'Ensure applied heat does not exceed the vapor temperature of the oil and water.',
+      5: 'Flammable vapors possibly present. Ensure applied heat does not exceed the vapor temperature of the oil and water.',
+      8: 'Note: Samples that are further than .3 ml apart are questionable.'
+    };
+    cloned.steps = cloned.steps.map(step =>
+      step.stepNumber in t2CentrifugeInstructions
+        ? { ...step, instructions: t2CentrifugeInstructions[step.stepNumber] }
+        : step
+    );
+  }
+
   return cloned;
 });
 

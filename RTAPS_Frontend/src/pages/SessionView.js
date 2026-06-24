@@ -586,7 +586,6 @@ const SessionView = () => {
                     
                     <div>
                       <h4 className="text-lg font-semibold text-gray-900">Step {step.stepNumber}: {step.title}</h4>
-                      <p className="text-gray-600">{step.description}</p>
                       {!isCompleted && blockedHintSteps.has(step.id) && (
                         <p className="text-xs text-gray-500">Finish the current step to continue.</p>
                       )}
