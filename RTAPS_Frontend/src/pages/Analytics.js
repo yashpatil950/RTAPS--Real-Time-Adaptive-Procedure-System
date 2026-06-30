@@ -70,6 +70,25 @@ const secOrDash = (v) => (v == null ? '—' : `${v}s`);
 const getMode = (s) => (s.metadata && s.metadata.mode) || s.mode || 'adaptive';
 const isAdaptiveSession = (s) => getMode(s) !== 'non-adaptive';
 
+// Percentage of the session that lost usable eye data (orange/red connector
+// states), measured live during the procedure. null for sessions recorded
+// before this was tracked, or when no eye data flowed (streaming disabled).
+const getDataLostPct = (s) => {
+  const v = s.metadata && s.metadata.dataLostPct;
+  return typeof v === 'number' ? v : null;
+};
+
+// Tailwind text color for a data-loss percentage: green when nothing was lost,
+// amber for a modest amount, red once a meaningful share was lost.
+const dataLossColor = (pct) =>
+  pct === 0 ? 'text-green-700' : pct < 20 ? 'text-orange-700' : 'text-red-700';
+
+// Small inline cell rendering a session's eye-data-loss percentage.
+const DataLossCell = ({ pct }) => {
+  if (pct == null) return <span className="text-gray-400 text-xs">N/A</span>;
+  return <span className={`font-medium ${dataLossColor(pct)}`}>{pct}%</span>;
+};
+
 // Aggregate per-second workload from a session's steps. The live system records
 // `highPredictionCount` (seconds the displayed workload was "high") and
 // `predictionCount` (total seconds a prediction was produced, ~1 per second)
@@ -312,9 +331,20 @@ const Analytics = () => {
     };
   }, [filteredSessions]);
 
+  // Average eye-tracker data loss across the currently filtered sessions (only
+  // sessions that recorded the metric are averaged).
+  const dataLossOverall = useMemo(() => {
+    const vals = filteredSessions
+      .map((s) => getDataLostPct(s))
+      .filter((v) => v != null);
+    if (vals.length === 0) return { hasData: false, avgPct: 0, count: 0 };
+    const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+    return { hasData: true, avgPct: avg, count: vals.length };
+  }, [filteredSessions]);
+
   const handleExportCSV = () => {
     const headers = [
-      'SessionId', 'CompletedAt', 'Participant', 'Procedure', 'Mode', 'Train', 'TotalTimeSec',
+      'SessionId', 'CompletedAt', 'Participant', 'Procedure', 'Mode', 'Train', 'TotalTimeSec', 'DataLostPct',
       'StepNumber', 'StepTitle', 'TimeSpentSec',
       'WorkloadHigh', 'AdaptationShown', 'FinalWorkloadLevel', 'TimeToAdaptationSec',
       'MaxHighProba', 'HighSeconds', 'LowSeconds', 'PredictionSeconds', 'PctHigh', 'PctLow',
@@ -334,6 +364,7 @@ const Analytics = () => {
           getMode(s),
           s.trainNumber ? `Train ${s.trainNumber}` : 'N/A',
           s.totalTimeSec || 0,
+          getDataLostPct(s) == null ? '' : getDataLostPct(s),
           st.stepNumber,
           (st.stepTitle || '').replace(/,/g, ' '),
           st.timeSpentSec || 0,
@@ -559,6 +590,26 @@ const Analytics = () => {
         </div>
       )}
 
+      {/* Average eye-tracker data loss across the filtered sessions. */}
+      {dataLossOverall.hasData && (
+        <div className="bg-white rounded-lg shadow p-6">
+          <div className="flex items-center justify-between mb-1">
+            <h3 className="text-lg font-semibold text-gray-900">Eye-Tracking Data Loss</h3>
+            <span className="text-sm text-gray-500">{dataLossOverall.count} session{dataLossOverall.count === 1 ? '' : 's'}</span>
+          </div>
+          <div className="flex items-baseline gap-2">
+            <span className={`text-3xl font-bold ${dataLossColor(dataLossOverall.avgPct)}`}>
+              {dataLossOverall.avgPct}%
+            </span>
+            <span className="text-gray-600">average data lost</span>
+          </div>
+          <p className="text-xs text-gray-400 mt-2">
+            Average share of each procedure spent with the eye tracker showing an orange or red connection (pupil not
+            captured, or no eye data) rather than green. Higher means more eye data was lost during the session.
+          </p>
+        </div>
+      )}
+
       {selectedProcedureId !== 'all' && (
         <>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -652,6 +703,18 @@ const Analytics = () => {
                   <th className="px-3 py-2 whitespace-nowrap">Total Time</th>
                   <th className="px-3 py-2 whitespace-nowrap">
                     <div className="relative inline-flex items-center space-x-1 group cursor-default">
+                      <span>Data loss</span>
+                      <Info className="w-4 h-4 text-gray-400" />
+                      <span
+                        role="tooltip"
+                        className="invisible group-hover:visible absolute left-0 top-full mt-2 w-72 text-xs text-gray-800 bg-white border border-gray-200 rounded-md shadow p-2 z-10 normal-case font-normal"
+                      >
+                        Share of the procedure the eye tracker showed an orange or red connection (pupil not captured, or no eye data) rather than green. Sampled live during the session.
+                      </span>
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 whitespace-nowrap">
+                    <div className="relative inline-flex items-center space-x-1 group cursor-default">
                       <span>Workload time (high / low)</span>
                       <Info className="w-4 h-4 text-gray-400" />
                       <span
@@ -697,7 +760,7 @@ const Analytics = () => {
                   const isExpanded = expandedSessionIds.has(key);
                   const wl = sessionWorkload(s);
                   const adaptive = isAdaptiveSession(s);
-                  const colCount = isAdmin ? 10 : 9;
+                  const colCount = isAdmin ? 11 : 10;
                   return (
                     <React.Fragment key={key}>
                       <tr className="border-t border-gray-200">
@@ -751,6 +814,9 @@ const Analytics = () => {
                           )}
                         </td>
                         <td className="px-3 py-3 text-gray-700 whitespace-nowrap">{formatTime(s.totalTimeSec || 0)}</td>
+                        <td className="px-3 py-3 whitespace-nowrap">
+                          <DataLossCell pct={getDataLostPct(s)} />
+                        </td>
                         <td className="px-3 py-3">
                           <WorkloadSplitBar wl={wl} />
                         </td>

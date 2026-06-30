@@ -285,6 +285,12 @@ class SessionState:
     min_confidence: float
     blink_tracking_loss_s: float
 
+    # Stricter confidence threshold used only for the live connection badge's
+    # "is the eye being captured well" measure (pupil_good_recent). Defaults to
+    # the ML `min_confidence` when not supplied, so existing call sites that
+    # don't pass it keep their previous behavior. See Settings.connection_min_confidence.
+    connection_min_confidence: Optional[float] = None
+
     procedure_id: Optional[int] = None
     step_number: Optional[int] = None
     step_id: Optional[int] = None
@@ -321,6 +327,9 @@ class SessionState:
     record_raw: bool = False
     raw_max_samples: int = 2_000_000
     raw_truncated: bool = field(default=False, init=False)
+    # Count of raw pupil frames received (incl. low-confidence) — a "frames are
+    # arriving" signal even when none pass the confidence filter.
+    raw_pupil_received_total: int = field(default=0, init=False)
     _raw_pupil: list = field(default_factory=list)
     _raw_blinks: list = field(default_factory=list)
     _raw_fixations: list = field(default_factory=list)
@@ -351,6 +360,8 @@ class SessionState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def __post_init__(self) -> None:
+        if self.connection_min_confidence is None:
+            self.connection_min_confidence = self.min_confidence
         self.baseline = BaselineTracker(self.baseline_duration_s, self.min_confidence)
 
     # ---- ingress -------------------------------------------------------- #
@@ -377,19 +388,39 @@ class SessionState:
         """
         if not self.record_raw:
             return 0
-        n = 0
-        for item in (pupil or []):
+        pupil = pupil or []
+        blinks = blinks or []
+        fixations = fixations or []
+        for item in pupil:
             self._raw_append(self._raw_pupil, item)
-            n += 1
-        for item in (blinks or []):
+        for item in blinks:
             self._raw_append(self._raw_blinks, item)
-            n += 1
-        for item in (fixations or []):
+        for item in fixations:
             self._raw_append(self._raw_fixations, item)
-            n += 1
+        self.raw_pupil_received_total += len(pupil)
+        n = len(pupil) + len(blinks) + len(fixations)
         if n:
             self.last_seen_wall = time.time()
         return n
+
+    def pupil_good_recent(self, n: int = 240) -> Optional[float]:
+        """Fraction of the most recent raw pupil frames whose detection
+        confidence meets the connection threshold — a live measure of how well
+        the camera is currently capturing the eye(s). None if no raw frames yet.
+
+        Uses `connection_min_confidence` (default 0.7), the stricter threshold
+        reserved for the green/orange/red connection badge, NOT the ML
+        pipeline's `min_confidence` (0.6)."""
+        recent = self._raw_pupil[-n:]
+        if not recent:
+            return None
+        threshold = self.connection_min_confidence or self.min_confidence
+        good = sum(
+            1
+            for p in recent
+            if isinstance(p, dict) and (p.get("confidence") or 0) >= threshold
+        )
+        return good / len(recent)
 
     def add_pupil(self, samples: list[_PupilRec]) -> int:
         accepted = 0
@@ -654,6 +685,8 @@ class SessionState:
             # many seconds means the bridge / Online Fixation Detector plugin
             # isn't sending anything).
             "pupil_received_total": self.pupil_received_total,
+            "raw_pupil_received_total": self.raw_pupil_received_total,
+            "pupil_good_recent": self.pupil_good_recent(),
             "blinks_received_total": self.blinks_received_total,
             "fixations_received_total": self.fixations_received_total,
             "last_blink_received_at": self.last_blink_received_at,
@@ -742,6 +775,7 @@ class SessionRegistry:
         min_confidence: float,
         blink_tracking_loss_s: float,
         idle_ttl_s: float,
+        connection_min_confidence: Optional[float] = None,
         record_raw: bool = False,
         raw_max_samples: int = 2_000_000,
     ):
@@ -750,6 +784,7 @@ class SessionRegistry:
         self._blink_window_len_s = blink_window_len_s
         self._baseline_duration_s = baseline_duration_s
         self._min_confidence = min_confidence
+        self._connection_min_confidence = connection_min_confidence
         self._blink_tracking_loss_s = blink_tracking_loss_s
         self._idle_ttl_s = idle_ttl_s
         self._record_raw = record_raw
@@ -768,6 +803,7 @@ class SessionRegistry:
                     blink_window_len_s=self._blink_window_len_s,
                     baseline_duration_s=self._baseline_duration_s,
                     min_confidence=self._min_confidence,
+                    connection_min_confidence=self._connection_min_confidence,
                     blink_tracking_loss_s=self._blink_tracking_loss_s,
                     record_raw=self._record_raw,
                     raw_max_samples=self._raw_max_samples,

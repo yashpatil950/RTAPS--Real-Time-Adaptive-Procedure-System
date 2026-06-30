@@ -77,6 +77,7 @@ async def lifespan(app: FastAPI):
         blink_window_len_s=settings.blink_window_len_s,
         baseline_duration_s=settings.baseline_duration_s,
         min_confidence=settings.min_confidence,
+        connection_min_confidence=settings.connection_min_confidence,
         blink_tracking_loss_s=settings.blink_tracking_loss_s,
         idle_ttl_s=settings.session_idle_ttl_s,
         record_raw=settings.raw_data_enabled,
@@ -480,6 +481,7 @@ async def session_dashboard(stream_id: str) -> dict:
         "baseline_duration_s": settings.baseline_duration_s,
         "expected_pupil_rate_hz_per_eye": settings.expected_pupil_rate_hz_per_eye,
         "min_confidence": settings.min_confidence,
+        "connection_min_confidence": settings.connection_min_confidence,
         "min_data_yield": settings.min_data_yield,
     }
     return snap

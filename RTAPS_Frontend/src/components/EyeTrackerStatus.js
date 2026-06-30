@@ -6,13 +6,11 @@ import {
   getSessionDashboard,
   streamingReady,
 } from '../services/streamingApi';
+import { classifyEyeStatus, readEyeCounters } from '../utils/eyeTrackerStatus';
 
 // How often to re-check the eye tracker. Pupil frames stream at ~120 Hz, so the
 // backend's counters rise every poll while the tracker is live.
 const POLL_MS = 3000;
-// Below this fraction of recent frames being well-detected, we treat the eye as
-// "not properly captured" (camera can see frames but can't resolve the pupil).
-const GOOD_FRACTION_THRESHOLD = 0.5;
 
 const STYLES = {
   connected: { dot: 'bg-green-500', cls: 'bg-green-50 border-green-200 text-green-700', label: 'Connected' },
@@ -31,7 +29,7 @@ const STYLES = {
 //   gray   — streaming integration is off in this browser
 const EyeTrackerStatus = () => {
   const [status, setStatus] = useState('checking');
-  const prev = useRef({ raw: null, acc: null });
+  const prev = useRef({ counters: null });
 
   useEffect(() => {
     if (typeof window === 'undefined' || !isStreamingIntegrationEnabled()) {
@@ -49,28 +47,9 @@ const EyeTrackerStatus = () => {
           return;
         }
         const d = await getSessionDashboard(sid);
-        const raw = d?.raw_pupil_received_total ?? 0;
-        const acc = d?.pupil_received_total ?? 0;
-        const good = typeof d?.pupil_good_recent === 'number' ? d.pupil_good_recent : null;
-
-        const pr = prev.current;
-        prev.current = { raw, acc };
-        if (pr.raw == null) {
-          if (!cancelled) setStatus('checking'); // first poll: establish a baseline
-          return;
-        }
-        const rawRising = raw > pr.raw;
-        const accRising = acc > pr.acc;
-        let next;
-        if (rawRising) {
-          // Frames are arriving — judge capture quality.
-          if (good == null) next = accRising ? 'connected' : 'poor';
-          else next = good >= GOOD_FRACTION_THRESHOLD ? 'connected' : 'poor';
-        } else if (accRising) {
-          next = 'connected'; // raw archival off, but usable frames are flowing
-        } else {
-          next = 'no-data'; // no frames at all
-        }
+        const pr = prev.current.counters;
+        prev.current = { counters: readEyeCounters(d) };
+        const next = classifyEyeStatus(pr, d);
         if (!cancelled) setStatus(next);
       } catch (_) {
         try {

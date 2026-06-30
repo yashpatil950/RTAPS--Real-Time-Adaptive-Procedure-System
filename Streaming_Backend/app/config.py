@@ -52,6 +52,13 @@ class Settings:
     stride_s: float = _env_float("STRIDE_S", 1.0)
     baseline_duration_s: float = _env_float("BASELINE_DURATION_S", 120.0)
     min_confidence: float = _env_float("MIN_CONFIDENCE", 0.6)
+    # Confidence threshold used ONLY for the live eye-tracker connection badge
+    # (the green / orange / red "Eye tracker" status). This is intentionally
+    # stricter than `min_confidence` (0.7 vs 0.6): a frame counts as "well
+    # captured" for the connection indicator only when its detection confidence
+    # is >= 0.7. The ML feature pipeline (baseline + accepted samples) keeps
+    # using `min_confidence` so the train/serve contract above is untouched.
+    connection_min_confidence: float = _env_float("CONNECTION_MIN_CONFIDENCE", 0.7)
     blink_tracking_loss_s: float = _env_float("BLINK_TRACKING_LOSS_S", 2.0)
     expected_pupil_rate_hz_per_eye: float = _env_float("EXPECTED_PUPIL_RATE_HZ", 60.0)
     min_data_yield: float = _env_float("MIN_DATA_YIELD", 0.6)

@@ -7,13 +7,20 @@ import { getStepFeedback } from '../data/stepFeedback';
 import {
   ensureStoredStreamId,
   getStoredStreamId,
+  getSessionDashboard,
   isStreamingIntegrationEnabled,
   streamingSessionStart,
   streamingStepChange,
   streamingSessionEnd,
   subscribePredictions,
 } from '../services/streamingApi';
+import { classifyEyeStatus, readEyeCounters, isDataLossStatus } from '../utils/eyeTrackerStatus';
 import CalibrationScreen from '../components/CalibrationScreen';
+
+// How often we sample the eye-tracker connection status while a procedure runs,
+// to measure how much of the session was spent with usable eye data (green)
+// versus lost (orange/red). Matches the badge poll cadence in EyeTrackerStatus.
+const EYE_STATUS_POLL_MS = 3000;
 
 // How long the operator sits at the fixation cross before the procedure starts.
 // Must match Streaming_Backend `BASELINE_DURATION_S` (default 120 s) so the
@@ -80,6 +87,14 @@ const SessionView = () => {
   const [sessionEndTime, setSessionEndTime] = useState(null);
   const [isSessionComplete, setIsSessionComplete] = useState(false);
   const hasSavedAnalyticsRef = useRef(false);
+  // Eye-tracker data-loss tracking. We sample the same green/orange/red
+  // connection signal the operator sees and tally how many samples were
+  // "good" (green) vs "lost" (orange/red) across the procedure. On completion
+  // we turn this into a percentage stored in the session analytics.
+  //   - eyePrevCountersRef: previous poll's { raw, acc } counters (for diffing)
+  //   - eyeLossStatsRef:    running { good, lost } sample counts
+  const eyePrevCountersRef = useRef(null);
+  const eyeLossStatsRef = useRef({ good: 0, lost: 0 });
   const [blockedHintSteps, setBlockedHintSteps] = useState(new Set());
   // devExtraSeconds is still added into the session-timer math so the legacy
   // "+10s (dev)" mechanism doesn't break for anyone still using it programmatically.
@@ -269,6 +284,52 @@ const SessionView = () => {
     return cleanup;
   }, [procedure, trainNumber, streamingHookReady, isAdaptive]);
 
+  // Sample the eye-tracker connection status while the procedure is running so
+  // the completed-session analytics can report how much of the session lost
+  // usable eye data. Each poll classifies the same green/orange/red signal the
+  // operator's badge shows: green ('connected') counts as good, orange ('poor')
+  // and red ('no-data'/'offline') count as lost. Runs only while a backend
+  // session is live (post-calibration) and the procedure is still in progress.
+  useEffect(() => {
+    if (!procedure || typeof window === 'undefined') return undefined;
+    if (!isStreamingIntegrationEnabled()) return undefined;
+    if (!streamingHookReady || isSessionComplete) return undefined;
+    const sid = ensureStoredStreamId(procedure.id, trainNumber).trim();
+    if (!sid) return undefined;
+
+    let cancelled = false;
+    const sample = async () => {
+      try {
+        const d = await getSessionDashboard(sid);
+        if (cancelled) return;
+        const prevCounters = eyePrevCountersRef.current;
+        eyePrevCountersRef.current = readEyeCounters(d);
+        const status = classifyEyeStatus(prevCounters, d);
+        // Skip the first poll ('checking') — no baseline to diff against yet.
+        if (status === 'checking') return;
+        if (isDataLossStatus(status)) {
+          eyeLossStatsRef.current.lost += 1;
+        } else if (status === 'connected') {
+          eyeLossStatsRef.current.good += 1;
+        }
+      } catch (_) {
+        // Backend unreachable mid-procedure is also lost data, but ignore a
+        // first-sample error (no baseline established yet) to mirror the
+        // skipped 'checking' state above.
+        if (!cancelled && eyePrevCountersRef.current) {
+          eyeLossStatsRef.current.lost += 1;
+        }
+      }
+    };
+
+    sample();
+    const id = setInterval(sample, EYE_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [procedure?.id, trainNumber, streamingHookReady, isSessionComplete]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Initialize step start times — only AFTER calibration completes, so the
   // first step's elapsed time starts at 0 (not at "120 s into the page mount").
   useEffect(() => {
@@ -360,6 +421,13 @@ const SessionView = () => {
             });
             const stepsWithAdaptation = stepSummaries.filter((x) => x.adaptationShown).length;
             const stepsWithPredictions = stepSummaries.filter((x) => x.predictionCount > 0).length;
+            // Eye-tracker data loss: share of sampled connection checks that
+            // were orange/red (lost) rather than green (good). null when no
+            // samples were taken (e.g. streaming disabled — no eye data flow).
+            const eyeStats = eyeLossStatsRef.current;
+            const eyeSamples = eyeStats.good + eyeStats.lost;
+            const dataLostPct =
+              eyeSamples > 0 ? Math.round((100 * eyeStats.lost) / eyeSamples) : null;
             // Get current user data
             const currentUser = JSON.parse(localStorage.getItem('currentParticipant') || '{}');
             
@@ -384,6 +452,11 @@ const SessionView = () => {
                 stepsWithAdaptation,
                 stepsWithPredictions,
                 totalSteps: stepSummaries.length,
+                // Eye-tracker data loss over the procedure (orange/red share).
+                dataLostPct,
+                dataLossSamples: eyeSamples,
+                dataGoodSamples: eyeStats.good,
+                dataLostSamples: eyeStats.lost,
               },
             }).catch(error => {
               console.error('Failed to save session to API:', error);
