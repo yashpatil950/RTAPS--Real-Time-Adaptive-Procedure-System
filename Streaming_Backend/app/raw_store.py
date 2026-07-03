@@ -47,10 +47,18 @@ def _safe(part: Any) -> str:
 
 
 def _data_key(meta: dict) -> str:
+    # Filename encodes participant and procedure mode (adaptive/non-adaptive)
+    # up front so each archived session is identifiable from its name alone,
+    # e.g. raw_sessions/<participant>/<participant>__<mode>__<stream>__<ts>.json.gz.
+    # (The file also stays under a per-participant folder for grouping.)
     ts = int(meta.get("persisted_at") or time.time())
     participant = _safe(meta.get("participant_id") or "unknown")
+    mode = _safe(meta.get("mode") or "unknownmode")
     stream = _safe(meta.get("stream_id") or "session")
-    return f"{settings.raw_data_s3_prefix}/{participant}/{stream}__{ts}{_DATA_SUFFIX}"
+    return (
+        f"{settings.raw_data_s3_prefix}/{participant}/"
+        f"{participant}__{mode}__{stream}__{ts}{_DATA_SUFFIX}"
+    )
 
 
 def _meta_key(data_key: str) -> str:
